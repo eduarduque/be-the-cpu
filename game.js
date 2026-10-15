@@ -387,13 +387,15 @@
         <header class="hero">
           <div class="badge">a game for learning to read code</div>
           <h1>Be the <span class="cpu big">CPU</span></h1>
-          <p>Code is hard to follow because you can't see the computer working. Here, <b>you</b> are the computer: tap the line that runs next, carry values to where they belong, and watch the call stack grow and shrink, right on top of real C++.</p>
+          <p>Code is hard to follow because you can't see the computer working. Paste any C++ program and <b>you</b> become the computer: predict the line that runs next, carry values to where they belong, and watch the call stack grow and shrink, right on top of your code.</p>
         </header>
+        <div id="pastebox"></div>
         <section class="how3">
-          <div><span>👆</span><b>Tap the next line</b><p>Programs jump around. Predict where.</p></div>
-          <div><span>📦</span><b>Carry the values</b><p>Put each value in the box it lands in.</p></div>
-          <div><span>🤔</span><b>Predict the result</b><p>Say what prints before it does.</p></div>
+          <div><span>👆</span><b>Predict the next line</b><p>Programs jump around. Guess where before it happens.</p></div>
+          <div><span>📦</span><b>Carry the values</b><p>Tap where each value lands when a function is called.</p></div>
+          <div><span>👀</span><b>Or just watch</b><p>Switch to Watch mode and step through like a debugger.</p></div>
         </section>
+        <h2 class="sect">New to this? Start with the guided levels</h2>
         <section class="levels">
           ${LEVELS.map((l, i) => `
             <button class="lvcard" data-level="${i}">
@@ -406,11 +408,18 @@
         <p class="foot muted">Tip: when you're stuck, <b>💡 Show me</b> highlights the answer, and <b>↶ Undo</b> steps backwards.</p>
       </div>`;
     app.querySelectorAll('[data-level]').forEach(b => (b.onclick = () => startLevel(+b.dataset.level)));
+    window.Tracer.mountEditor(document.getElementById('pastebox'));
+    window.scrollTo(0, 0);
   }
 
-  // #3 opens level 3; #3@7 jumps straight to step 7 (handy for testing and sharing)
-  const [lv, at] = location.hash.slice(1).split('@').map(Number);
-  if (lv >= 1 && lv <= LEVELS.length) {
+  window.BTC = { tokenize, esc, home, flyGhost };
+
+  // #code=... opens a shared program; #3 opens level 3; #3@7 jumps straight to step 7
+  const hash = location.hash.slice(1);
+  const [lv, at] = hash.split('@').map(Number);
+  if (hash.startsWith('code=')) {
+    if (!window.Tracer.openShared(hash.slice(5))) home();
+  } else if (lv >= 1 && lv <= LEVELS.length) {
     startLevel(lv - 1);
     if (at > 0 && at < L.steps.length) { idx = at; state = stateAt(at); render(); }
   } else home();
