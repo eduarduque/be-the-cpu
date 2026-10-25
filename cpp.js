@@ -127,11 +127,12 @@
       else if (UNSUPPORTED_TYPES[name]) unsupported(UNSUPPORTED_TYPES[name], x.line);
       else if (!TYPE_WORDS.has(name) && !classes.has(name)) fail(`Unknown type '${name}'. This visualizer understands int, double, bool, char, string, vector and your own classes/structs.`, x.line);
       while (is('const')) { next(); isConst = true; }
+      const base = ty;
       while (is('*')) { next(); ty = { name: 'ptr', to: ty }; while (is('const')) next(); }
       let ref = false;
       if (is('&')) { next(); ref = true; }
       if (is('&&')) unsupported('Rvalue references (&&)');
-      return { ty, isConst, ref };
+      return { ty, isConst, ref, base };
     }
 
     function isDeclStart() {
@@ -195,10 +196,15 @@
         next();
         const { ty } = parseType();
         let args = [], count = null;
-        if (eat('[')) { count = parseExpr(); expect(']'); }
+        let init = null;
+        if (eat('[')) {
+          count = parseExpr(); expect(']');
+          if (eat('(')) { expect(')'); init = node('list', x.line, { items: [] }); }
+          else if (eat('{')) init = parseList();
+        }
         else if (eat('(')) args = parseArgs(')');
         else if (eat('{')) args = parseArgs('}');
-        return node('new', x.line, { ty, args, count });
+        return node('new', x.line, { ty, args, count, init });
       }
       if (is('delete')) {
         next();
@@ -206,7 +212,14 @@
         if (eat('[')) { expect(']'); arr = true; }
         return node('delete', x.line, { e: parseUnary(), arr });
       }
-      if (is('sizeof')) unsupported('sizeof');
+      if (is('sizeof')) {
+        next();
+        if (is('(') && (TYPE_WORDS.has(peek(1).v) || classes.has(peek(1).v) || (is('std', 1) && is('::', 2))) && !is('(', 2) && !is('.', 2) && !is('[', 2) && !is('->', 2)) {
+          next(); const { ty } = parseType(); expect(')');
+          return node('sizeof', x.line, { ty });
+        }
+        return node('sizeof', x.line, { e: parseUnary() });
+      }
       if (is('(') && TYPE_WORDS.has(peek(1).v) && (is(')', 2) || is('*', 2))) {
         next(); const { ty } = parseType(); expect(')');
         return node('cast', x.line, { ty, e: parseUnary() });
@@ -217,6 +230,14 @@
       const args = [];
       if (!eat(close)) { do args.push(parseAssign()); while (eat(',')); expect(close); }
       return args;
+    }
+    function parseList() { // after '{': items may be nested { } lists
+      const line = t[p - 1].line, items = [];
+      if (!eat('}')) {
+        do { if (is('}')) break; items.push(eat('{') ? parseList() : parseAssign()); } while (eat(','));
+        expect('}');
+      }
+      return node('list', line, { items });
     }
     function parsePostfix() {
       let e = parsePrimary();
@@ -355,10 +376,10 @@
     }
     function parseDecl() {
       const line = where();
-      const { ty, isConst, ref } = parseType();
+      const { ty, isConst, ref, base } = parseType();
       const decls = [];
       do {
-        let dty = ty, dref = ref;
+        let dty = decls.length ? base : ty, dref = decls.length ? false : ref;
         while (eat('*')) dty = { name: 'ptr', to: dty };
         if (eat('&')) dref = true;
         const dl = where();
@@ -367,13 +388,13 @@
         while (eat('[')) { dims.push(is(']') ? null : parseExpr()); expect(']'); }
         let init = null, args = null;
         if (eat('=')) {
-          if (is('{')) { next(); init = node('list', dl, { items: parseArgs('}') }); }
+          if (eat('{')) init = parseList();
           else init = parseAssign();
         } else if (is('(')) {
           next(); args = parseArgs(')');
         } else if (is('{')) {
-          next(); const items = parseArgs('}');
-          if (dims.length || dty.name === 'vector') init = node('list', dl, { items });
+          next(); const L = parseList(), items = L.items;
+          if (dims.length || dty.name === 'vector') init = L;
           else if (classes.has(dty.name)) args = items;
           else init = items[0] || node('num', dl, { v: 0 });
         }
@@ -394,7 +415,7 @@
           const { ty, isConst, ref } = parseType();
           let pty = ty, pname = null;
           if (peek().k === 'id') pname = ident();
-          if (eat('[')) { if (!is(']')) parseExpr(); expect(']'); pty = { name: 'ptr', to: ty, arr: true }; }
+          while (eat('[')) { if (!is(']')) parseExpr(); expect(']'); pty = { name: 'ptr', to: ty, arr: true }; }
           let def = null;
           if (eat('=')) def = parseAssign();
           params.push({ ty: pty, ref, isConst, name: pname, def });
@@ -453,8 +474,8 @@
           const dims = [];
           while (eat('[')) { dims.push(parseExpr()); expect(']'); }
           let init = null;
-          if (eat('=')) init = parseAssign();
-          else if (eat('{')) { const items = parseArgs('}'); init = items[0] || null; }
+          if (eat('=')) init = eat('{') ? parseList() : parseAssign();
+          else if (eat('{')) { const L = parseList(); init = dims.length || classes.has(ty.name) ? L : L.items[0] || null; }
           cls.fields.push({ name: fname, ty, dims, init, access, line: ml });
           if (!eat(',')) break;
           fname = ident();
@@ -493,6 +514,7 @@
       prog.globals.push(d);
     }
 
+    function mergeDefs(pr, f) { pr.params.forEach((x, i) => { if (x.def && !f.params[i].def) f.params[i].def = x.def; }); }
     // attach out-of-class definitions (Class::method) to their declarations
     for (const f of prog.funcs) {
       if (!f.cls) continue;
@@ -500,7 +522,7 @@
       if (!c) fail(`Unknown class '${f.cls}'.`, f.line);
       if (f.isCtor) {
         const i = c.ctors.findIndex(x => x.proto && x.params.length === f.params.length);
-        if (i >= 0) { f.access = c.ctors[i].access; c.ctors[i] = f; } else fail(`This constructor isn't declared inside class ${f.cls}.`, f.line);
+        if (i >= 0) { f.access = c.ctors[i].access; mergeDefs(c.ctors[i], f); c.ctors[i] = f; } else fail(`This constructor isn't declared inside class ${f.cls}.`, f.line);
       } else if (f.isDtor) {
         c.dtor = f;
       } else {
@@ -509,8 +531,13 @@
         if (i < 0) fail(`'${f.name}' isn't declared inside class ${f.cls}. Add its declaration to the class first.`, f.line);
         f.access = list[i].access;
         if (list[i].isConst !== f.isConst) fail(`'${f.name}' is declared ${list[i].isConst ? 'const' : 'non-const'} in the class but defined ${f.isConst ? 'const' : 'non-const'} here. They must match.`, f.line);
+        mergeDefs(list[i], f);
         list[i] = f;
       }
+    }
+    for (const f of prog.funcs) {
+      if (f.cls || f.proto) continue;
+      for (const pr of prog.funcs) if (pr.proto && !pr.cls && pr.name === f.name && pr.params.length === f.params.length) mergeDefs(pr, f);
     }
     prog.free = prog.funcs.filter(f => !f.cls);
 
@@ -553,6 +580,171 @@
     const NULLPTR = { t: 'ptr', cell: null };
     const OSTREAM = { t: 'ostream' }, ISTREAM = { t: 'istream' }, ENDL = { t: 'endl' };
 
+    // ----- memory: fake but realistic, deterministic addresses
+    // Stack grows down from STACK0 (each call lower), globals sit at GLOB0, heap blocks grow up from HEAP0.
+    // Roots (variables, heap blocks) get an address when created; fields and slots are laid out inside them.
+    const STACK0 = 0x7ffd5000, GLOB0 = 0x00404000, HEAP0 = 0x55a3c000;
+    let sp = STACK0, gp = GLOB0, hp = HEAP0;
+    const live = new Set();
+    const up = (a, n) => Math.ceil(a / n) * n;
+    const ARR = (of, n) => ({ name: 'array', of, n });
+    const PRIM = { int: 4, double: 8, bool: 1, char: 1, string: 32, ptr: 8, vector: 24, void: 1, auto: 8 };
+    const isPrimTy = t => t.name in PRIM && t.name !== 'vector';
+    function fieldTy(fd) { return fd._ty || (fd._ty = fd.dims.reduceRight((t, d) => ARR(t, num(evalE(d), fd.line)), fd.ty)); }
+    function layoutOf(cls) {
+      if (cls.lay) return cls.lay;
+      let off = 0, al = 1;
+      const offs = {};
+      for (const fd of cls.fields) {
+        const t = fieldTy(fd), a = alignTy(t);
+        off = up(off, a); offs[fd.name] = off; off += sizeTy(t); al = Math.max(al, a);
+      }
+      return (cls.lay = { size: Math.max(1, up(off, al)), align: al, offs });
+    }
+    function sizeTy(t) {
+      if (t.name === 'array') return t.n * sizeTy(t.of);
+      if (prog.classes[t.name]) return layoutOf(prog.classes[t.name]).size;
+      return PRIM[t.name] || 4;
+    }
+    function alignTy(t) {
+      if (t.name === 'array') return alignTy(t.of);
+      if (prog.classes[t.name]) return layoutOf(prog.classes[t.name]).align;
+      return Math.min(8, PRIM[t.name] || 4);
+    }
+    function tyName(t) {
+      if (!t || t.name === 'auto') return null;
+      if (t.name === 'ptr') return (tyName(t.to) || 'void') + '*';
+      if (t.name === 'vector') return `vector<${tyName(t.elem) || '?'}>`;
+      if (t.name === 'array') { let d = '', x = t; while (x.name === 'array') { d += `[${x.n}]`; x = x.of; } return (tyName(x) || '?') + d; }
+      return t.name;
+    }
+    function vty(v) { // a type worked out from a value (for auto, temporaries)
+      switch (v.t) {
+        case 'int': case 'double': case 'bool': case 'char': case 'string': return { name: v.t };
+        case 'uninit': return { name: v.of === 'pointer' ? 'ptr' : v.of, to: { name: 'void' } };
+        case 'ptr': return { name: 'ptr', to: !v.cell ? { name: 'void' } : v.cell.past ? v.cell.ety : cty(v.cell) };
+        case 'vec': return v.arr ? ARR(v.elem, v.items.length) : { name: 'vector', elem: v.elem };
+        case 'obj': return { name: v.cls };
+      }
+      return { name: 'void' };
+    }
+    const cty = c => (c.ty && c.ty.name !== 'auto' ? c.ty : vty(c.val));
+    const sizeV = c => sizeTy(cty(c));
+    function place(c, a) { // put c at address a, and lay out everything inside it
+      c.addr = a;
+      const v = c.val;
+      if (v.t === 'obj') {
+        const cls = prog.classes[v.cls], L = layoutOf(cls);
+        if (cls.flat === undefined) cls.flat = cls.fields.every(fd => !fd.dims.length && isPrimTy(fd.ty));
+        if (cls.flat && v._at === a) return; // only plain fields: nothing inside can have moved
+        v._at = a;
+        for (const k in v.fields) { const f = v.fields[k]; f.up = c; place(f, a + L.offs[k]); }
+      } else if (v.t === 'vec') {
+        const es = sizeTy(v.elem), n = v.items.length;
+        v.owner = c;
+        let b = a;
+        if (!v.arr) { // a vector's elements live in a separate heap buffer
+          if (!n && v.buf == null) return;
+          if (v.buf == null || n > v.cap) { v.cap = Math.max(n, (v.cap || 0) * 2, 1); v.buf = heapBump(v.cap * es); }
+          b = v.buf;
+        }
+        if (v._at === b && v._n === n && isPrimTy(v.elem) && (!n || (v.items[0].addr === b && v.items[n - 1].addr === b + (n - 1) * es))) return;
+        v._at = b; v._n = n;
+        v.items.forEach((it, i) => { it.home = v; it.ix = i; it.up = c; place(it, b + i * es); });
+      }
+    }
+    function heapBump(n) { const a = up(hp, 16); hp = a + up(Math.max(n, 1), 16) + 16; return a; } // +16: malloc's bookkeeping
+    function rawStack(n, al) { sp = Math.floor((sp - n) / al) * al; return sp; }
+    function stackAlloc(c, keep) { place(c, rawStack(sizeV(c), alignTy(cty(c)))); if (keep) live.add(c); }
+    function globalAlloc(c) { gp = up(gp, alignTy(cty(c))); place(c, gp); gp += sizeV(c); live.add(c); }
+    function heapAlloc(c) { place(c, heapBump(sizeV(c))); }
+    function relayout() {
+      for (const c of live) place(c, c.addr);
+      for (const h of heap) if (!h.freed) place(h, h.addr);
+    }
+    function addrOf(c) {
+      if (c.past) return endAddr(c);
+      if (c.addr === undefined) relayout();
+      return c.addr ?? null;
+    }
+    function markFreed(c) {
+      c.freed = true;
+      if (c.val.t === 'obj') Object.values(c.val.fields).forEach(markFreed);
+      if (c.val.t === 'vec' && c.val.arr) c.val.items.forEach(markFreed);
+    }
+    const hidOf = c => c.hid || (c.home && c.home.owner && c.home.owner.hid) || (c.single && c.single.hid) || null;
+
+    // ----- pointers into arrays: a pointer holds an element cell, or a one-past-the-end marker
+    function homeOf(c) {
+      if (c.home === undefined) { relayout(); if (c.home === undefined) c.home = null; }
+      return c.home && c.home.items[c.ix] === c ? c.home : null;
+    }
+    function region(c) { // the array c lives in: { items, idx, ety, home | single }
+      if (c.past) return c.home ? { home: c.home, items: c.home.items, idx: c.idx, ety: c.ety } : { single: c.single, items: [c.single], idx: 1, ety: c.ety };
+      const h = homeOf(c);
+      if (h) return { home: h, items: h.items, idx: c.ix, ety: h.elem };
+      return { single: c, items: [c], idx: 0, ety: cty(c) };
+    }
+    function endCell(R) { // cached so p == q works for two one-past-the-end pointers
+      const o = R.home || R.single, n = R.items.length;
+      if (!o.end || o.end.idx !== n) o.end = { id: ++cellId, past: true, home: R.home || null, single: R.single || null, idx: n, ety: R.ety, get val() { return { t: 'uninit', of: R.ety.name }; }, set val(x) {} };
+      return o.end;
+    }
+    function endAddr(c) {
+      if (c.single) { const a = addrOf(c.single); return a == null ? null : a + sizeV(c.single); }
+      const h = c.home, es = sizeTy(h.elem);
+      if (h.arr) { if (!h.owner) relayout(); const a = h.owner ? addrOf(h.owner) : null; return a == null ? null : a + c.idx * es; }
+      return h.buf != null ? h.buf + c.idx * es : null;
+    }
+    const isArrV = v => v.t === 'vec' && v.arr;
+    function decay(v) { // an array used as a value turns into a pointer to its first element
+      if (!isArrV(v)) return v;
+      return { t: 'ptr', cell: v.items.length ? v.items[0] : endCell({ home: v, items: v.items, idx: 0, ety: v.elem }) };
+    }
+    function arrName(R) {
+      if (R.single) return nameOf(R.single) || 'that variable';
+      if (!R.home.owner) relayout();
+      return (R.home.owner && nameOf(R.home.owner)) || 'the array';
+    }
+    function ptrTarget(pv) {
+      const c = pv.cell;
+      if (!c) return 'nothing (nullptr)';
+      if (c.past) return `one past the end of ${arrName(region(c))}`;
+      return nameOf(c) || 'a temporary';
+    }
+    function unitText(ety, n) {
+      const t = tyName(ety) || 'element', a = Math.abs(n);
+      return `${a} ${a === 1 ? t : /^\w+$/.test(t) ? t + 's' : t + ' elements'} (${a * sizeTy(ety)} bytes)`;
+    }
+    function checkPtr(pv, e) {
+      const what = exprText(e.o || e.e || e);
+      if (pv.t === 'uninit') err(`${what} was never given an address, so it points to random memory.`, e.line);
+      if (pv.t !== 'ptr') err(`Only pointers can be followed with * or ->. ${what} is ${typeName(pv)}.${pv.t === 'obj' ? ' Use . instead of ->.' : ''}`, e.line);
+      if (!pv.cell) err('Null pointer! This pointer is nullptr (it points to nothing), so following it crashes the program.', e.line);
+      if (pv.cell.freed || (pv.cell.past && (pv.cell.single || pv.cell.home.owner || {}).freed)) err('Use after delete! This memory was already deleted, so the pointer is dangling. In real C++ this is undefined behavior.', e.line);
+    }
+    function ptrMove(pv, n, e, what) { // pointer + n elements
+      pv = decay(pv);
+      if (pv.t === 'ptr' && !pv.cell) err(`${what}: this pointer is nullptr, so it doesn't point into any array. Pointer arithmetic only works on a pointer into an array.`, e.line);
+      checkPtr(pv, e);
+      const R = region(pv.cell), j = R.idx + n, len = R.items.length;
+      const arr = R.single ? `${arrName(R)}, which is a single ${tyName(R.ety)} (not an array)` : `${arrName(R)}, which has ${len} element${len === 1 ? '' : 's'}`;
+      if (j < 0) err(`${what} would point ${-j} element${j === -1 ? '' : 's'} before the start of ${arr}. A pointer may only move around inside its array (or to one past the end).`, e.line);
+      if (j > len) err(`${what} would point ${j - len + 1} elements past the last element of ${arr}. C++ lets a pointer go at most one past the end, and never further.`, e.line);
+      return { t: 'ptr', cell: j === len ? endCell(R) : R.items[j] };
+    }
+    function ptrIndex(pv, e) { // the pointer must point at a real element, not one past the end
+      const c = pv.cell;
+      if (c && c.past) {
+        const R = region(c), len = R.items.length;
+        err(R.single
+          ? `${exprText(e.o || e.e || e)} points just past ${arrName(R)}, which is a single ${tyName(R.ety)}. Nothing there belongs to your program, so it can't be read or written.`
+          : `${exprText(e.o || e.e || e)} points one past the end of ${arrName(R)} (it has ${len} element${len === 1 ? '' : 's'}, indexes 0 to ${len - 1}). That spot isn't part of the array, so reading or writing it is a bug: real C++ would quietly use whatever memory comes next.`, e.line);
+      }
+      return c;
+    }
+    function samePlace(a, b) { const x = region(a), y = region(b); return x.home ? x.home === y.home : x.single === y.single; }
+
     function err(msg, line) {
       const e = new CppError(msg, line ?? (top() ? top().line : 1));
       e.runtime = true;
@@ -585,7 +777,7 @@
       }
       for (const h of heap) {
         if (h === c) return `heap #${h.hid}`;
-        const r = findIn(h.val, c, `#${h.hid}`); if (r) return r;
+        const r = findIn(h.val, c, `heap #${h.hid}`); if (r) return r;
       }
       return null;
     }
@@ -613,22 +805,23 @@
         case 'string': return { t: 'p', text: `"${visible(v.v)}"` };
         case 'uninit': return { t: 'u' };
         case 'ptr':
-          if (!v.cell) return { t: 'ptr', target: null };
-          if (v.cell.freed) return { t: 'ptr', dangling: true, heap: v.cell.hid };
-          return { t: 'ptr', target: nameOf(v.cell) || 'a temporary', tid: v.cell.id, heap: v.cell.hid || null };
+          if (!v.cell) return { t: 'ptr', target: null, to: null };
+          if (v.cell.freed) return { t: 'ptr', dangling: true, heap: hidOf(v.cell), to: addrOf(v.cell) };
+          if (v.cell.past) return { t: 'ptr', target: ptrTarget(v), tid: null, heap: hidOf(v.cell), to: addrOf(v.cell), past: true };
+          return { t: 'ptr', target: nameOf(v.cell) || 'a temporary', tid: v.cell.id, heap: hidOf(v.cell), to: addrOf(v.cell) };
         case 'obj': {
           const cls = prog.classes[v.cls];
           return {
             t: 'obj', cls: v.cls,
             fields: Object.entries(v.fields).map(([k, c]) => ({
-              name: k, id: c.id,
+              name: k, id: c.id, addr: c.addr ?? null, size: sizeV(c), ty: tyName(cty(c)),
               priv: (cls.fields.find(f => f.name === k) || {}).access !== 'public',
               val: depth > 4 ? { t: 'p', text: '…' } : disp(c.val, depth + 1),
             })),
           };
         }
         case 'vec':
-          return { t: 'vec', items: v.items.slice(0, 40).map(c => ({ id: c.id, val: disp(c.val, depth + 1) })), more: Math.max(0, v.items.length - 40) };
+          return { t: 'vec', items: v.items.slice(0, 40).map(c => ({ id: c.id, addr: c.addr ?? null, size: sizeV(c), ty: tyName(cty(c)), val: disp(c.val, depth + 1) })), more: Math.max(0, v.items.length - 40) };
         default: return { t: 'p', text: '?' };
       }
     }
@@ -654,6 +847,8 @@
         case 'num': return String(e.v);
         case 'this': return 'this';
         case 'call': return `${exprText(e.f)}(…)`;
+        case 'bin': return `${exprText(e.l)} ${e.op} ${exprText(e.r)}`;
+        case 'post': return exprText(e.e) + e.op;
         default: return 'it';
       }
     }
@@ -665,16 +860,19 @@
         throw e;
       }
       if (top()) top().line = line;
+      relayout();
       const fv = f => f.vars.map(v => ({
         name: v.name, anchor: v.anchor, id: v.cell.id, isThis: !!v.isThis,
         ref: v.ref ? nameOf(v.cell) || 'a temporary value' : null,
         val: v.isThis ? disp({ t: 'ptr', cell: v.cell }) : disp(v.cell.val),
+        ...(v.isThis ? { addr: v.slot ?? null, size: 8, ty: `${v.cell.val.cls}*` }
+          : { addr: v.cell.addr ?? null, size: sizeV(v.cell), ty: tyName(cty(v.cell)) + (v.ref ? '&' : '') }),
       }));
       steps.push({
         line, kind, note: note || null, did,
         frames: frames.map(f => ({ uid: f.def ? f.def.uid : null, label: f.label, callLine: f.callLine, vars: fv(f) })),
         globals: fv(globals),
-        heap: heap.map(h => ({ hid: h.hid, id: h.id, freed: !!h.freed, val: h.freed ? null : disp(h.val) })),
+        heap: heap.map(h => ({ hid: h.hid, id: h.id, freed: !!h.freed, val: h.freed ? null : disp(h.val), addr: h.addr ?? null, size: sizeV(h), ty: tyName(cty(h)) })),
         out,
         temp: temp ? { line: temp.line, val: disp(temp.val) } : null,
       });
@@ -697,9 +895,17 @@
       return num(v, line) !== 0;
     }
     function copy(v) {
-      if (v.t === 'obj') { const f = {}; for (const k in v.fields) f[k] = cell(copy(v.fields[k].val)); return { ...v, fields: f }; }
-      if (v.t === 'vec') return { ...v, items: v.items.map(c => cell(copy(c.val))) };
+      if (v.t === 'obj') { const f = {}; for (const k in v.fields) f[k] = cell(copy(v.fields[k].val), { ty: v.fields[k].ty }); return { ...v, fields: f, _at: undefined }; }
+      if (v.t === 'vec') return { t: 'vec', arr: v.arr, elem: v.elem, items: v.items.map(c => cell(copy(c.val), { ty: c.ty })) };
       return v;
+    }
+    function assignInto(c, v) { // c = v, member by member, so fields/slots keep their cells (and addresses)
+      const o = c.val;
+      if (o.t === 'obj' && v.t === 'obj' && o.cls === v.cls && o !== v) { for (const k in o.fields) assignInto(o.fields[k], v.fields[k].val); return; }
+      if (isArrV(o) && isArrV(v) && o.items.length === v.items.length && o !== v) { o.items.forEach((it, i) => assignInto(it, v.items[i].val)); return; }
+      const nv = copy(v);
+      if (o.t === 'vec' && !o.arr && nv.t === 'vec' && o.buf != null && o.cap >= nv.items.length) { nv.buf = o.buf; nv.cap = o.cap; }
+      c.val = nv;
     }
     function convert(v, ty, line) {
       if (!ty || ty.name === 'auto') return v;
@@ -716,11 +922,13 @@
           return err(`Can't store ${typeName(v)} in a string.${v.t === 'int' || v.t === 'double' ? ' Use to_string(...) to convert a number to text.' : ''}`, line);
         case 'ptr':
           if (v.t === 'ptr') return v;
+          if (isArrV(v)) return decay(v);
           return err(`Can't store ${typeName(v)} in a pointer. Pointers hold addresses, like &x or new ...`, line);
         case 'vector':
           if (v.t === 'vec') return v;
           return err(`Can't store ${typeName(v)} in a vector.`, line);
         case 'void': return VOID;
+        case 'array': if (isArrV(v)) return v; return err(`Can't store ${typeName(v)} in an array.`, line);
         default:
           if (v.t === 'obj' && v.cls === ty.name) return v;
           return err(`Can't store ${typeName(v)} in a ${ty.name}.`, line);
@@ -744,7 +952,7 @@
         case 'vector': return { t: 'vec', elem: ty.elem, items: [] };
         default: {
           const cls = prog.classes[ty.name];
-          if (cls) { const c = cell(shell(cls)); construct(cls, c, [], line, `a new ${cls.name}`); return c.val; }
+          if (cls) { const c = cell(shell(cls), { ty }); construct(cls, c, [], line, `a new ${cls.name}`); return c.val; }
           return I(0);
         }
       }
@@ -760,34 +968,39 @@
     }
     function shell(cls) {
       const fields = {};
-      for (const fd of cls.fields) fields[fd.name] = cell({ t: 'uninit', of: fd.ty.name === 'ptr' ? 'pointer' : fd.ty.name });
+      for (const fd of cls.fields) fields[fd.name] = cell({ t: 'uninit', of: fd.ty.name === 'ptr' ? 'pointer' : fd.ty.name }, { ty: fieldTy(fd) });
       return { t: 'obj', cls: cls.name, fields };
     }
 
     // ----- scopes
     function addVar(f, name, c, anchor, extra = {}) {
       const v = { name, cell: c, anchor, ...extra };
+      if (!v.ref && !v.isThis && c.addr === undefined) (f === globals ? globalAlloc(c) : stackAlloc(c, true));
       f.vars.push(v);
       f.scopes[f.scopes.length - 1].push(v);
       return v;
     }
-    function pushScope() { top().scopes.push([]); }
+    function pushScope() { const sc = []; sc.sp = sp; top().scopes.push(sc); }
     function popScope(line) {
       if (halted) return;
       const f = top();
       const sc = f.scopes.pop();
       for (let i = sc.length - 1; i >= 0; i--) {
         const v = sc[i];
-        if (!v.ref && !v.isThis) destroyVal(v.cell, line, v.name);
+        if (!v.ref && !v.isThis && !v.cell.moved) destroyVal(v.cell, line, v.name);
       }
       f.vars = f.vars.filter(v => !sc.includes(v));
+      for (const v of sc) if (!v.ref && !v.isThis) live.delete(v.cell);
+      if (sc.sp != null) sp = sc.sp;
     }
     function destroyVal(c, line, label) {
       if (c.val.t === 'obj') {
         const cls = prog.classes[c.val.cls];
         if (cls.dtor && cls.dtor.body) { say(`${label} is going away, so its destructor runs`); callFunc(cls.dtor, [], line, c, { quietReturn: true }); }
       } else if (c.val.t === 'vec') {
-        c.val.items.forEach((it, i) => destroyVal(it, line, `${label}[${i}]`));
+        const its = c.val.items.map((it, i) => [it, i]);
+        if (c.val.arr) its.reverse(); // array elements are destroyed last-to-first
+        its.forEach(([it, i]) => destroyVal(it, line, `${label}[${i}]`));
       }
     }
     function lookupVar(name) {
@@ -812,75 +1025,169 @@
       }
       const ty = d.ty;
       if (d.dims.length) {
-        const inits = d.init && d.init.k === 'list' ? d.init.items : [];
-        const n = d.dims[0] ? num(evalE(d.dims[0]), d.line) : inits.length;
-        if (n < 0 || n > 10000) err(`An array size of ${n} isn't allowed here.`, d.line);
-        const items = [];
-        for (let i = 0; i < n; i++) {
-          if (i < inits.length) items.push(cell(convert(evalE(inits[i]), ty, d.line)));
-          else items.push(cell(d.init || isGlobal ? zeroOf(ty, d.line) : defaultVal(ty, d.line, false)));
-        }
-        addVar(f, d.name, cell({ t: 'vec', arr: true, elem: ty, items }), anchor);
-        say(`${d.name} is an array with ${n} slot${n === 1 ? '' : 's'}`);
+        let list = d.init && d.init.k === 'list' ? d.init : null;
+        if (d.init && d.init.k === 'str' && ty.name === 'char' && d.dims.length === 1) list = node0('list', d.line, { items: [...d.init.v, '\0'].map(v => node0('char', d.line, { v })) });
+        if (d.init && !list) err(`An array is filled with a { } list, like int ${d.name}[3] = {1, 2, 3};`, d.line);
+        const dims = d.dims.map((x, k) => (x ? num(evalE(x), d.line) : k === 0 && list ? list.items.length : err(`The array ${d.name} needs a size inside [ ].`, d.line)));
+        for (const n of dims) if (n < 0 || n > 10000 || !Number.isInteger(n)) err(`An array size of ${n} isn't allowed here.`, d.line);
+        if (dims.reduce((x, y) => x * y, 1) > 100000) err('This array is too big for the visualizer.', d.line);
+        const aty = dims.reduceRight((t, n) => ARR(t, n), ty);
+        const c = cell(mkArr(aty), { ty: aty });
+        addVar(f, d.name, c, anchor);
+        initArr(c, list, d.line, !!d.init || isGlobal, d.name);
+        const n = dims[0];
+        say(dims.length === 1 ? `${d.name} is an array with ${n} slot${n === 1 ? '' : 's'}` : `${d.name} is a ${dims.join('×')} array: ${n} row${n === 1 ? '' : 's'} of ${dims.slice(1).join('×')}, stored one after another in memory`);
         return;
       }
       const cls = prog.classes[ty.name];
-      if (cls && !d.init) {
-        const c = cell(shell(cls));
+      if (cls && (!d.init || d.init.k === 'list' || (d.init.k === 'construct' && d.init.cls === cls.name))) {
+        const c = cell(shell(cls), { ty });
         addVar(f, d.name, c, anchor);
         if (d.isConst) c.isConst = true;
         say(`Space for ${d.name} is reserved. Now its constructor builds it`);
-        construct(cls, c, d.args || [], d.line, d.name);
+        construct(cls, c, d.init ? (d.init.k === 'list' ? d.init.items : d.init.args) : d.args || [], d.line, d.name);
+        return;
+      }
+      if (cls) { // Box b = a;  Box b = makeBox();  Box b = 5;
+        const c = cell(shell(cls), { ty });
+        addVar(f, d.name, c, anchor);
+        const src = isLvalExpr(d.init) ? lval(d.init) : null;
+        const v = src ? src.val : evalE(d.init);
+        if (v.t === 'obj' && v.cls === cls.name) {
+          if (src) copyObj(cls, c, src, d.line, d.name, exprText(d.init));
+          else { c.val = v; say(`New variable ${d.name} = ${short(v)}`); }
+        } else {
+          say(`Space for ${d.name} is reserved. Now its constructor builds it`);
+          construct(cls, c, [{ k: 'val', v, cell: src, line: d.line }], d.line, d.name);
+        }
+        if (d.isConst) c.isConst = true;
         return;
       }
       let val;
       if (d.init) {
         if (d.init.k === 'list') {
-          if (ty.name === 'vector') val = { t: 'vec', elem: ty.elem, items: d.init.items.map(e => cell(convert(copy(evalE(e)), ty.elem, d.line))) };
-          else val = d.init.items.length ? convert(evalE(d.init.items[0]), ty, d.line) : zeroOf(ty, d.line);
-        } else val = convert(copy(evalE(d.init)), ty, d.line);
+          if (ty.name === 'vector') val = initVal(ty, d.init, d.line, d.name);
+          else val = d.init.items.length ? copy(convert(evalE(d.init.items[0]), ty, d.line)) : zeroOf(ty, d.line);
+        } else val = copy(convert(evalE(d.init), ty, d.line));
       } else if (d.args) {
         if (ty.name === 'vector') {
           const n = d.args[0] ? num(evalE(d.args[0]), d.line) : 0;
           if (n < 0 || n > 10000) err(`A vector size of ${n} isn't allowed here.`, d.line);
           const fill = d.args[1] ? convert(evalE(d.args[1]), ty.elem, d.line) : null;
-          val = { t: 'vec', elem: ty.elem, items: Array.from({ length: n }, () => cell(fill ? copy(fill) : zeroOf(ty.elem, d.line))) };
+          val = { t: 'vec', elem: ty.elem, items: Array.from({ length: n }, () => cell(fill ? copy(fill) : zeroOf(ty.elem, d.line), { ty: ty.elem })) };
         } else if (ty.name === 'string' && d.args.length === 2) {
           const n = num(evalE(d.args[0]), d.line), ch = convert(evalE(d.args[1]), { name: 'char' }, d.line);
           val = S(ch.v.repeat(Math.max(0, n)));
-        } else val = d.args.length ? convert(copy(evalE(d.args[0])), ty, d.line) : zeroOf(ty, d.line);
+        } else val = d.args.length ? copy(convert(evalE(d.args[0]), ty, d.line)) : zeroOf(ty, d.line);
       } else val = defaultVal(ty, d.line, isGlobal);
-      const c = cell(val);
+      const c = cell(val, { ty });
       if (d.isConst) c.isConst = true;
       addVar(f, d.name, c, anchor);
       say(val.t === 'uninit'
         ? `${d.name} is created, but has no value yet (in real C++ it holds random garbage)`
         : `New variable ${d.name} = ${short(val)}`);
     }
+    const node0 = (k, line, props) => ({ k, line, ...props });
+    function mkArr(aty) { // array storage with placeholder slots (filled by initArr once it has an address)
+      const e = aty.of, cls = prog.classes[e.name];
+      return { t: 'vec', arr: true, elem: e, items: Array.from({ length: aty.n }, () => cell(e.name === 'array' ? mkArr(e) : cls ? shell(cls) : { t: 'uninit', of: e.name === 'ptr' ? 'pointer' : e.name }, { ty: e })) };
+    }
+    function initArr(c, list, line, zero, label) {
+      const v = c.val, cls = prog.classes[v.elem.name];
+      if (list && list.items.length > v.items.length) err(`${label} has ${v.items.length} slot${v.items.length === 1 ? '' : 's'}, but ${list.items.length} values were given.`, line);
+      v.items.forEach((it, i) => {
+        const x = list ? list.items[i] : undefined, lab = `${label}[${i}]`;
+        if (v.elem.name === 'array') {
+          if (x && x.k !== 'list') err(`${label} is a 2D array, so give each row its own { }, like {{1, 2}, {3, 4}}.`, line);
+          return initArr(it, x || null, line, zero || !!list, lab);
+        }
+        if (cls) {
+          if (!x) construct(cls, it, [], line, lab);
+          else if (x.k === 'list') construct(cls, it, x.items, line, lab);
+          else if (x.k === 'construct' && x.cls === cls.name) construct(cls, it, x.args, line, lab);
+          else construct(cls, it, [x], line, lab);
+          return;
+        }
+        it.val = x ? initVal(v.elem, x, line, lab) : zero ? zeroOf(v.elem, line) : defaultVal(v.elem, line, false);
+      });
+    }
+    function initVal(ty, x, line, label) { // value for one slot from an expression or a { } list
+      const cls = prog.classes[ty.name];
+      if (cls && (x.k === 'list' || (x.k === 'construct' && x.cls === cls.name))) {
+        const c = cell(shell(cls), { ty });
+        construct(cls, c, x.k === 'list' ? x.items : x.args, line, label);
+        return c.val;
+      }
+      if (x.k === 'list') {
+        if (ty.name === 'vector') return { t: 'vec', elem: ty.elem, items: x.items.map((y, i) => cell(initVal(ty.elem, y, line, `${label}[${i}]`), { ty: ty.elem })) };
+        return x.items.length ? copy(convert(evalE(x.items[0]), ty, line)) : zeroOf(ty, line);
+      }
+      return copy(convert(evalE(x), ty, line));
+    }
+    const copyCtorOf = cls => cls.ctors.find(f => f.params.length && f.params[0].ty.name === cls.name && f.params[0].ref && f.params.slice(1).every(x => x.def) && !f.proto);
+    function copyObj(cls, dst, src, line, label, srcText) { // copy-construct dst from src
+      const cc = copyCtorOf(cls);
+      if (cc) { callFunc(cc, [{ cell: src, val: src.val }], line, dst, { label: `${cls.name} copy constructor` }); return; }
+      dst.val = copy(src.val);
+      const ptrs = Object.keys(src.val.fields).filter(k => src.val.fields[k].val.t === 'ptr');
+      say(`${label} is a copy of ${srcText}: every field is copied one by one${ptrs.length ? `. ${ptrs.join(', ')} ${ptrs.length > 1 ? 'are pointers' : 'is a pointer'}, so only the address is copied: both objects now point to the SAME memory (a shallow copy)` : ''}`);
+    }
 
     // ----- functions
-    function pickFunc(list, nargs, what, line) {
+    function argScore(prm, v) { // how well a value fits a parameter (for picking an overload)
+      const t = prm.ty, vt = v.t === 'uninit' ? (v.of === 'pointer' ? 'ptr' : v.of) : v.t;
+      const NUM = ['int', 'double', 'bool', 'char'];
+      if (t.arr) return isArrV(v) ? 3 : vt === 'ptr' ? 2 : -100;
+      if (t.name === 'auto') return 1;
+      if (vt === 'obj') return v.cls === t.name ? 3 : -100;
+      if (t.name === 'vector') return vt === 'vec' && !v.arr ? 3 : -100;
+      if (t.name === 'ptr') {
+        if (isArrV(v)) return tyName(v.elem) === tyName(t.to) ? 3 : 1;
+        if (vt !== 'ptr') return -100;
+        return !v.cell || tyName(v.cell.past ? v.cell.ety : cty(v.cell)) === tyName(t.to) ? 3 : 1;
+      }
+      if (vt === t.name) return 3;
+      if (NUM.includes(t.name) && NUM.includes(vt)) return 2;
+      if (t.name === 'string' && vt === 'char') return 1;
+      return -100;
+    }
+    function pickFunc(list, args, what, line) {
+      const nargs = args.length;
       const ok = list.filter(f => (!f.proto || f.defaulted) && nargs <= f.params.length && nargs >= f.params.filter(x => !x.def).length);
       if (!ok.length) {
         if (list.some(f => f.params.length === nargs)) err(`${what} is declared but never defined (it has no body).`, line);
         const counts = [...new Set(list.map(f => f.params.length))].join(' or ');
         err(`${what} takes ${counts} argument${counts === '1' ? '' : 's'}, but ${nargs} ${nargs === 1 ? 'was' : 'were'} given.`, line);
       }
-      return ok.find(f => f.params.length === nargs) || ok[0];
+      if (ok.length === 1) return ok[0];
+      let best = null, bs = -Infinity;
+      for (const f of ok) { // overloads: the best match of argument types wins
+        let sc = f.params.length === nargs ? 0.5 : 0;
+        args.forEach((a, i) => { sc += argScore(f.params[i], a.val); });
+        if (sc > bs) { bs = sc; best = f; }
+      }
+      return best;
     }
     const isLvalExpr = e => ['id', 'member', 'arrow', 'index'].includes(e.k) || (e.k === 'un' && e.op === '*');
-    function prepArgs(def, exprs) {
-      return exprs.map((x, i) => {
+    function evalArgs(exprs) { // evaluate arguments once: { val, cell (if it names storage), e }
+      return exprs.map(x => {
+        if (x.k === 'val') return { cell: x.cell, val: x.v, e: x };
+        if (isLvalExpr(x) || x.k === 'call') { const c = lval(x); return { cell: c, val: c.val, e: x }; }
+        return { val: evalE(x), e: x };
+      });
+    }
+    function bindArgs(def, args) {
+      return args.map((a, i) => {
         const prm = def.params[i];
         if (prm && (prm.ref || prm.ty.arr)) {
-          if (!isLvalExpr(x) && x.k !== 'call') {
-            if (!prm.isConst) err(`'${prm.name}' is a non-const reference, so it must be given a variable, not a temporary value.`, x.line);
-            return { val: evalE(x) };
+          if (!a.cell) {
+            if (!prm.isConst) err(`'${prm.name}' is a non-const reference, so it must be given a variable, not a temporary value.`, a.e.line);
+            return { val: a.val };
           }
-          const c = lval(x);
-          return { cell: c, val: c.val };
+          return a;
         }
-        return { val: evalE(x) };
+        if (a.val.t === 'uninit' && a.e.k === 'id') err(`'${a.e.name}' is used before it was given a value. In real C++ it would hold random garbage.`, a.e.line);
+        return a;
       });
     }
     function construct(cls, c, argExprs, line, label) {
@@ -888,10 +1195,17 @@
         if (argExprs.length) {
           // aggregate init: Point p{1, 2};
           if (argExprs.length > cls.fields.length) err(`${cls.name} has only ${cls.fields.length} fields.`, line);
-          const vals = argExprs.map(e => evalE(e));
+          if (argExprs.length === 1 && argExprs[0].k !== 'list') { // Point b(a): a copy
+            const x = argExprs[0], src = x.k === 'val' ? x.cell || cell(x.v) : isLvalExpr(x) ? lval(x) : cell(evalE(x));
+            if (src.val.t === 'obj' && src.val.cls === cls.name) { copyObj(cls, c, src, line, label, exprText(x)); return; }
+            argExprs = [{ k: 'val', v: src.val, cell: src, line }];
+          }
           cls.fields.forEach((fd, i) => {
-            if (i < vals.length) c.val.fields[fd.name].val = convert(copy(vals[i]), fd.ty, line);
-            else c.val.fields[fd.name].val = fd.init ? convert(evalE(fd.init), fd.ty, line) : zeroOf(fd.ty, line);
+            const fc = c.val.fields[fd.name], x = i < argExprs.length ? argExprs[i] : fd.init, lab = `${label}.${fd.name}`;
+            if (fd.dims.length) {
+              if (x && x.k !== 'list') err(`${fd.name} is an array, so it needs a { } list.`, line);
+              fc.val = mkArr(fieldTy(fd)); initArr(fc, x || null, line, true, lab);
+            } else fc.val = x ? initVal(fd.ty, x, line, lab) : zeroOf(fd.ty, line);
           });
           say(`${label}'s fields are filled in order`);
           return;
@@ -899,9 +1213,13 @@
         initFields(cls, c, null, line);
         return;
       }
-      const def = pickFunc(cls.ctors, argExprs.length, `The ${cls.name} constructor`, line);
+      const args = evalArgs(argExprs);
+      if (args.length === 1 && args[0].val.t === 'obj' && args[0].val.cls === cls.name && !copyCtorOf(cls)) {
+        copyObj(cls, c, args[0].cell || cell(args[0].val), line, label, exprText(args[0].e)); return;
+      }
+      const def = pickFunc(cls.ctors, args, `The ${cls.name} constructor`, line);
       if (def.defaulted) { initFields(cls, c, null, line); return; }
-      callFunc(def, prepArgs(def, argExprs), line, c, { label: `${cls.name} constructor` });
+      callFunc(def, bindArgs(def, args), line, c, { label: `${cls.name} ${def === copyCtorOf(cls) ? 'copy ' : ''}constructor` });
     }
     function initFields(cls, objCell, inits, line) {
       if (inits) for (const i of inits) if (!cls.fields.some(f => f.name === i.name)) err(`'${i.name}' is not a field of ${cls.name}.`, i.line);
@@ -912,14 +1230,14 @@
         if (init) {
           if (fcls) { fc.val = shell(fcls); construct(fcls, fc, init.args, init.line, fd.name); }
           else {
-            fc.val = init.args.length ? convert(copy(evalE(init.args[0])), fd.ty, init.line) : zeroOf(fd.ty, line);
+            fc.val = init.args.length ? copy(convert(evalE(init.args[0]), fd.ty, init.line)) : zeroOf(fd.ty, line);
             say(`${fd.name} = ${short(fc.val)} (from the initializer list)`);
           }
         } else if (fd.dims.length) {
-          const n = num(evalE(fd.dims[0]), fd.line);
-          fc.val = { t: 'vec', arr: true, elem: fd.ty, items: Array.from({ length: n }, () => cell(fd.init ? zeroOf(fd.ty) : { t: 'uninit', of: fd.ty.name })) };
+          fc.val = mkArr(fieldTy(fd));
+          initArr(fc, fd.init && fd.init.k === 'list' ? fd.init : null, fd.line, !!fd.init, fd.name);
         } else if (fd.init) {
-          fc.val = convert(copy(evalE(fd.init)), fd.ty, fd.line);
+          fc.val = initVal(fd.ty, fd.init, fd.line, fd.name);
         } else if (fcls || fd.ty.name === 'string' || fd.ty.name === 'vector') {
           if (fcls) { fc.val = shell(fcls); construct(fcls, fc, [], line, fd.name); } else fc.val = zeroOf(fd.ty, line);
         }
@@ -934,26 +1252,40 @@
         if (!a) a = { val: evalE(prm.def) };
         return { prm, a };
       });
+      const sp0 = sp;
+      if (!isMain) sp -= 16; // return address + saved frame pointer
+      const slot = thisCell ? rawStack(8, 8) : null;
+      const made = bound.map(({ prm, a }) => { // value parameters are fresh copies in the new frame
+        if (!prm.name || prm.ref || prm.ty.arr) return null;
+        const pc = prog.classes[prm.ty.name];
+        let c;
+        if (pc && copyCtorOf(pc) && a.val.t === 'obj' && a.val.cls === pc.name) {
+          c = cell(shell(pc), { ty: prm.ty }); stackAlloc(c, true);
+          copyObj(pc, c, a.cell || cell(a.val), callLine, prm.name, a.e ? exprText(a.e) : 'the argument');
+        } else { c = cell(copy(convert(a.val, prm.ty, callLine)), { ty: prm.ty }); stackAlloc(c, true); }
+        return c;
+      });
       const f = { label, def, callLine, vars: [], scopes: [[]], thisCell, line: def.line };
+      f.scopes[0].sp = sp;
       frames.push(f);
-      if (thisCell) addVar(f, 'this', thisCell, def.line, { isThis: true });
+      if (thisCell) addVar(f, 'this', thisCell, def.line, { isThis: true, slot });
       const parts = [];
-      for (const { prm, a } of bound) {
-        if (!prm.name) continue;
+      bound.forEach(({ prm, a }, i) => {
+        if (!prm.name) return;
         if (prm.ref || prm.ty.arr) {
           const c = a.cell || cell(a.val);
-          addVar(f, prm.name, c, def.line, { ref: true });
+          addVar(f, prm.name, c, def.line, { ref: true, arrParam: !!prm.ty.arr });
           parts.push(`${prm.name} → ${nameOf(c) || 'a temporary'}`);
         } else {
-          const c = cell(convert(copy(a.val), prm.ty, callLine));
+          const c = made[i];
           if (prm.isConst) c.isConst = true;
           addVar(f, prm.name, c, def.line);
           parts.push(`${prm.name} = ${short(c.val)}`);
         }
-      }
+      });
       if (isMain) say('The program starts at main()');
       else if (def.isDtor) say(`Running the destructor of ${nameOf(thisCell) || 'the object'}`);
-      else say(`Jump to ${def.isCtor ? `the ${def.cls} constructor` : label + '()'}${callLine ? `, leaving a 🚩 on line ${callLine}` : ''}${parts.length ? `. Copied in: ${parts.join(', ')}` : ''}`);
+      else say(`Jump to ${def.isCtor ? `the ${def.cls} ${opts.label && opts.label.includes('copy') ? 'copy ' : ''}constructor` : label + '()'}${callLine ? `, leaving a 🚩 on line ${callLine}` : ''}${parts.length ? `. Copied in: ${parts.join(', ')}` : ''}`);
       snapshot(def.line, 'call');
       if (def.isCtor) initFields(prog.classes[def.cls], thisCell, def.inits, def.line);
       let ret = { val: VOID };
@@ -969,9 +1301,14 @@
         if (isMain) ret = { val: I(0) };
         else err(`${label}() should return ${def.ret.ty.name === 'ptr' ? 'a pointer' : 'a ' + def.ret.ty.name}, but it reached its end without a return statement.`, def.endLine);
       }
-      if (wantsValue && !def.ret.ref) ret = { val: convert(copy(ret.val), def.ret.ty, def.endLine) };
+      if (wantsValue && !def.ret.ref) {
+        // returning a local object hands it over as is (no copy, no destructor), like real compilers do
+        if (ret.elide) { ret.elide.moved = true; ret = { val: convert(ret.val, def.ret.ty, def.endLine) }; }
+        else ret = { val: copy(convert(ret.val, def.ret.ty, def.endLine)) };
+      }
       popScope(def.endLine);
       frames.pop();
+      sp = sp0;
       if (frames.length && callLine != null && !opts.quietReturn) {
         if (wantsValue) {
           temp = { line: callLine, val: ret.val };
@@ -1054,8 +1391,8 @@
             pushScope();
             try {
               let c;
-              if (v.t === 'vec') c = s.ref ? v.items[i] : cell(convert(copy(v.items[i].val), s.ty, s.line));
-              else c = cell(C(v.v[i]));
+              if (v.t === 'vec') c = s.ref ? v.items[i] : cell(copy(convert(v.items[i].val, s.ty, s.line)), { ty: s.ty });
+              else c = cell(C(v.v[i]), { ty: { name: 'char' } });
               addVar(top(), s.name, c, s.line, s.ref ? { ref: true } : {});
               say(`${s.name} = ${short(c.val)} (element ${i} of ${s.range.src})`);
               try { branch(s.body); } catch (e) { if (e === BRK) stop = true; else if (e !== CONT) throw e; }
@@ -1069,7 +1406,11 @@
           let r = { val: VOID };
           if (s.e) {
             if (fdef && fdef.ret && fdef.ret.ref) { const c = lval(s.e); r = { val: c.val, cell: c }; }
-            else r = { val: evalE(s.e) };
+            else if (s.e.k === 'id') {
+              const c = lookupVar(s.e.name);
+              const local = c && c.val.t === 'obj' && top().vars.some(v => v.cell === c && !v.ref && !v.isThis);
+              r = { val: evalE(s.e), elide: local ? c : null };
+            } else r = { val: evalE(s.e) };
           }
           throw new Ret(r);
         }
@@ -1093,11 +1434,9 @@
 
     // ----- expressions
     function deref(pv, e) {
-      if (pv.t === 'uninit') err(`${exprText(e.o || e.e || e)} was never given an address, so it points to random memory.`, e.line);
-      if (pv.t !== 'ptr') err(`Only pointers can be followed with * or ->. ${exprText(e.o || e.e || e)} is ${typeName(pv)}.${pv.t === 'obj' ? ' Use . instead of ->.' : ''}`, e.line);
-      if (!pv.cell) err('Null pointer! This pointer is nullptr (it points to nothing), so following it crashes the program.', e.line);
-      if (pv.cell.freed) err('Use after delete! This memory was already deleted, so the pointer is dangling. In real C++ this is undefined behavior.', e.line);
-      return pv.cell;
+      pv = decay(pv);
+      checkPtr(pv, e);
+      return ptrIndex(pv, e);
     }
     function checkAccess(clsName, member, access, line, kind) {
       if (access === 'public') return;
@@ -1137,7 +1476,16 @@
           const c = lval(e.o);
           const i = num(evalE(e.i), e.line);
           let v = c.val;
-          if (v.t === 'ptr') v = deref(v, e).val;
+          if (v.t === 'ptr' || (v.t === 'uninit' && v.of === 'pointer')) {
+            const t = v.cell;
+            if (t && !t.past && !t.freed && (t.val.t === 'vec' || t.val.t === 'string') && !homeOf(t)) v = deref(v, e).val; // pointer to a whole vector/string
+            else { // p[i] is *(p + i)
+              checkPtr(v, e);
+              const R = region(v.cell), j = R.idx + i, len = R.items.length;
+              if (j < 0 || j >= len || !Number.isInteger(i)) err(`Index ${i} is out of range! ${exprText(e.o)} points to ${R.single ? `${arrName(R)}, a single ${tyName(R.ety)} (not an array)` : `${R.idx ? `element ${R.idx} of ` : ''}${arrName(R)}, which has ${len} element${len === 1 ? '' : 's'}`}, so ${exprText(e)} would be element ${j}${j === len ? ' (one past the end)' : ''}.`, e.line);
+              return R.items[j];
+            }
+          }
           if (v.t === 'vec') {
             if (i < 0 || i >= v.items.length || !Number.isInteger(i)) err(`Index ${i} is out of range! ${exprText(e.o)} has ${v.items.length} element${v.items.length === 1 ? '' : 's'}, so valid indexes are 0 to ${v.items.length - 1}.`, e.line);
             return v.items[i];
@@ -1172,11 +1520,36 @@
       if (v.t === 'double') c.val = D(v.v + d);
       else if (v.t === 'char') c.val = C(String.fromCharCode(v.v.charCodeAt(0) + d));
       else if (v.t === 'int') c.val = I(v.v + d);
-      else err(`Can't use ${op} on ${typeName(v)}.`, e.line);
+      else if (v.t === 'ptr') {
+        c.val = ptrMove(v, d, e, `${exprText(e.e)}${op}`);
+        say(`${exprText(e.e)} moved ${d > 0 ? 'forward' : 'back'} ${unitText(region(c.val.cell).ety, 1)}: now points to ${ptrTarget(c.val)}`);
+        return;
+      } else err(`Can't use ${op} on ${typeName(v)}.`, e.line);
       say(`${exprText(e.e)}${op} → ${exprText(e.e)} = ${short(c.val)}`);
     }
     function str(v) { return v.t === 'string' || v.t === 'char' ? v.v : null; }
-    function binop(op, a, b, line) {
+    function ptrArith(op, a, b, line, ex) { // p + n, n + p, p - n, p - q
+      const pl = a.t === 'ptr' || isArrV(a);
+      const ce = !ex ? { line } : ex.k === 'assign' ? { line, e: ex.l } : { line, e: pl ? ex.l : ex.r };
+      const what = !ex ? 'This' : ex.k === 'assign' ? `${exprText(ex.l)} ${ex.op} ${exprText(ex.r)}` : exprText(ex);
+      a = decay(a); b = decay(b);
+      if (a.t === 'ptr' && b.t === 'ptr') {
+        if (op === '+') err('Two pointers can\'t be added together. You can subtract them (p - q) to count the elements between them.', line);
+        checkPtr(a, { line, e: ex && ex.l }); checkPtr(b, { line, e: ex && ex.r });
+        if (!samePlace(a.cell, b.cell)) err(`${what}: subtracting pointers only makes sense when both point into the same array.`, line);
+        const d = region(a.cell).idx - region(b.cell).idx;
+        if (ex && ex.k === 'bin') say(`${what} = ${d}: the two addresses are ${unitText(region(a.cell).ety, d)} apart`);
+        return I(d);
+      }
+      if (!pl && op === '-') err('A pointer can\'t be subtracted from a number. Did you mean p - n?', line);
+      const p = pl ? a : b, n = num(pl ? b : a, line);
+      if (!Number.isInteger(n)) err('A pointer can only move by a whole number of elements.', line);
+      const k = op === '-' ? -n : n;
+      const r = ptrMove(p, k, ce, what);
+      if (ex && ex.k === 'bin') say(`${what} is the address ${unitText(region(r.cell).ety, k)} ${k >= 0 ? 'after' : 'before'} ${exprText(ce.e)}: ${ptrTarget(r)}`);
+      return r;
+    }
+    function binop(op, a, b, line, ex) {
       if (a.t === 'uninit' || b.t === 'uninit') err('A variable is used before it was given a value. In real C++ it would hold random garbage.', line);
       if (a.t === 'string' || b.t === 'string') {
         const x = str(a), y = str(b);
@@ -1189,11 +1562,19 @@
         }
         err(`Can't use ${op} on strings.`, line);
       }
-      if (a.t === 'ptr' || b.t === 'ptr') {
+      if (a.t === 'ptr' || b.t === 'ptr' || isArrV(a) || isArrV(b)) {
+        if (op === '+' || op === '-') return ptrArith(op, a, b, line, ex);
+        a = decay(a); b = decay(b);
         const pc = v => (v.t === 'ptr' ? v.cell : num(v, line) === 0 ? null : err('Pointers can only be compared with other pointers or nullptr.', line));
         if (op === '==') return B(pc(a) === pc(b));
         if (op === '!=') return B(pc(a) !== pc(b));
-        err('Pointer arithmetic isn\'t supported by this visualizer yet. Use [ ] to index arrays.', line);
+        if (['<', '>', '<=', '>='].includes(op)) {
+          if (a.t !== 'ptr' || b.t !== 'ptr' || !a.cell || !b.cell) err(`${op} on pointers only works for two pointers into the same array.`, line);
+          if (!samePlace(a.cell, b.cell)) err(`These two pointers point into different arrays (or variables), so comparing them with ${op} has no meaning.`, line);
+          const x = region(a.cell).idx, y = region(b.cell).idx;
+          return B(op === '<' ? x < y : op === '>' ? x > y : op === '<=' ? x <= y : x >= y);
+        }
+        err(`Can't use ${op} on pointers.`, line);
       }
       if (!['int', 'double', 'bool', 'char'].includes(a.t) || !['int', 'double', 'bool', 'char'].includes(b.t)) err(`Can't use ${op} on ${typeName(a)} and ${typeName(b)}.`, line);
       const x = num(a, line), y = num(b, line);
@@ -1227,16 +1608,26 @@
         case 'double': s = fmtDouble(v.v); break;
         case 'bool': s = v.v ? '1' : '0'; break;
         case 'char': case 'string': s = v.v; break;
-        case 'ptr': s = v.cell ? '0x' + (0x7ffe1000 + Number(String(v.cell.id).split(':')[0]) * 16).toString(16) : '0'; break;
+        case 'ptr': s = ptrText(v); break;
         case 'void': return err('This function returns nothing (void), so there\'s nothing to print.', line);
         case 'uninit': return err('Printing a variable that was never given a value. In real C++ this prints random garbage.', line);
-        default: return err(`cout doesn't know how to print ${typeName(v)}.${v.t === 'vec' ? ' Loop over it and print each element.' : v.t === 'obj' ? ' Print its fields one by one.' : ''}`, line);
+        default: if (isArrV(v)) { s = ptrText(decay(v)); break; } return err(`cout doesn't know how to print ${typeName(v)}.${v.t === 'vec' ? ' Loop over it and print each element.' : v.t === 'obj' ? ' Print its fields one by one.' : ''}`, line);
       }
       out += s;
       if (out.length > 20000) err('Too much output. Stopping here.', line);
       const last = did[did.length - 1];
       if (last && typeof last === 'object' && last.print != null) last.print += s;
       else did.push({ print: s });
+    }
+    function ptrText(v) { // cout << pointer: its address in hex (a char pointer into an array prints the text)
+      const c = v.cell;
+      if (!c) return '0';
+      if (!c.past && !c.freed && c.val.t === 'char' && homeOf(c)) {
+        let t = '';
+        for (const it of c.home.items.slice(c.ix)) { if (it.val.t !== 'char' || it.val.v === '\0') break; t += it.val.v; }
+        return t;
+      }
+      return '0x' + (addrOf(c) ?? 0).toString(16);
     }
     function readToken(line) {
       while (inPos < input.length && /\s/.test(input[inPos])) inPos++;
@@ -1268,22 +1659,27 @@
       if (e.count) {
         const n = num(evalE(e.count), e.line);
         if (n < 0 || n > 10000) err(`Can't create an array of ${n} elements.`, e.line);
-        const c = cell({ t: 'vec', arr: true, elem: e.ty, items: Array.from({ length: n }, () => cell(prog.classes[e.ty.name] ? zeroOf(e.ty, e.line) : { t: 'uninit', of: e.ty.name })) }, { heapCell: true, hid: ++heapId });
+        const aty = ARR(e.ty, n);
+        const c = cell(mkArr(aty), { ty: aty, heapCell: true, hid: ++heapId, isArr: true });
         heap.push(c);
-        say(`new: created an array of ${n} on the heap (#${c.hid})`);
-        return { t: 'ptr', cell: c };
+        heapAlloc(c);
+        initArr(c, e.init, e.line, !!e.init, `heap #${c.hid}`);
+        say(`new: created an array of ${n} on the heap (#${c.hid}). The pointer holds the address of its first element`);
+        return decay(c.val);
       }
       const cls = prog.classes[e.ty.name];
       if (cls) {
-        const c = cell(shell(cls), { heapCell: true, hid: ++heapId });
+        const c = cell(shell(cls), { ty: e.ty, heapCell: true, hid: ++heapId });
         heap.push(c);
+        heapAlloc(c);
         say(`new: space for a ${cls.name} is reserved on the heap (#${c.hid})`);
         construct(cls, c, e.args, e.line, `heap #${c.hid}`);
         return { t: 'ptr', cell: c };
       }
       const val = e.args.length ? convert(evalE(e.args[0]), e.ty, e.line) : { t: 'uninit', of: e.ty.name };
-      const c = cell(val, { heapCell: true, hid: ++heapId });
+      const c = cell(val, { ty: e.ty, heapCell: true, hid: ++heapId });
       heap.push(c);
+      heapAlloc(c);
       say(`new: created ${val.t === 'uninit' ? 'a ' + e.ty.name : short(val)} on the heap (#${c.hid})`);
       return { t: 'ptr', cell: c };
     }
@@ -1349,8 +1745,8 @@
       const label = exprText(e.f.o);
       switch (name) {
         case 'push_back': case 'emplace_back': {
-          const x = convert(copy(evalE(args[0])), v.elem, e.line);
-          v.items.push(cell(x));
+          const x = copy(convert(evalE(args[0]), v.elem, e.line));
+          v.items.push(cell(x, { ty: v.elem }));
           say(`${label}.push_back(${short(x)}): ${label} now has ${v.items.length} element${v.items.length === 1 ? '' : 's'}`);
           return { val: VOID };
         }
@@ -1381,9 +1777,10 @@
         if (cls.fields.some(f => f.name === name)) err(`${name} is a field, not a method, so it can't be called with ().`, line);
         err(`${cls.name} has no method named '${name}'.`, line);
       }
-      const def = pickFunc(list, args.length, `${cls.name}::${name}()`, line);
+      const vals = evalArgs(args);
+      const def = pickFunc(list, vals, `${cls.name}::${name}()`, line);
       checkAccess(cls.name, name, def.access, line, 'method');
-      return callFunc(def, prepArgs(def, args), line, objCell);
+      return callFunc(def, bindArgs(def, vals), line, objCell);
     }
     function call(e) {
       const f = e.f;
@@ -1393,8 +1790,9 @@
         if (tc && prog.classes[tc.val.cls].methods[name]) return method(tc, name, e.args, e.line);
         const fns = prog.free.filter(x => x.name === name);
         if (fns.length) {
-          const def = pickFunc(fns, e.args.length, `${name}()`, e.line);
-          return callFunc(def, prepArgs(def, e.args), e.line, null);
+          const vals = evalArgs(e.args);
+          const def = pickFunc(fns, vals, `${name}()`, e.line);
+          return callFunc(def, bindArgs(def, vals), e.line, null);
         }
         if (BUILTINS[name]) return { val: BUILTINS[name](e.args, e) };
         if (lookupVar(name)) err(`${name} is a variable, not a function.`, e.line);
@@ -1444,9 +1842,13 @@
           const c = lval(e.l);
           checkWritable(c, e.l);
           let r = evalE(e.r);
-          if (e.op !== '=') r = binop(e.op.slice(0, -1), c.val, r, e.line);
-          c.val = convertLike(copy(r), c.val, e.line);
-          say(`${exprText(e.l)} = ${short(c.val)}`);
+          const old = c.val;
+          if (e.op !== '=') r = binop(e.op.slice(0, -1), c.val, r, e.line, e);
+          assignInto(c, convertLike(r, c.val, e.line));
+          if (c.val.t === 'ptr' && old.t === 'ptr' && (e.op === '+=' || e.op === '-=')) {
+            const k = region(c.val.cell).idx - region(old.cell).idx;
+            say(`${exprText(e.l)} moved ${k >= 0 ? 'forward' : 'back'} ${unitText(region(c.val.cell).ety, k)}: now points to ${ptrTarget(c.val)}`);
+          } else say(`${exprText(e.l)} = ${short(c.val)}`);
           return c.val;
         }
         case 'bin': {
@@ -1462,7 +1864,7 @@
           }
           if (e.op === '&&') return B(truthy(evalE(e.l), e.line) && truthy(evalE(e.r), e.line));
           if (e.op === '||') return B(truthy(evalE(e.l), e.line) || truthy(evalE(e.r), e.line));
-          return binop(e.op, evalE(e.l), evalE(e.r), e.line);
+          return binop(e.op, evalE(e.l), evalE(e.r), e.line, e);
         }
         case 'un':
           switch (e.op) {
@@ -1485,20 +1887,41 @@
           const pv = evalE(e.e);
           if (pv.t !== 'ptr') err('delete only works on pointers.', e.line);
           if (!pv.cell) return VOID;
-          if (!pv.cell.heapCell) err('delete only works on memory that was created with new.', e.line);
-          if (pv.cell.freed) err('Double delete! This memory was already deleted once. That crashes real programs.', e.line);
-          destroyVal(pv.cell, e.line, `heap #${pv.cell.hid}`);
-          pv.cell.freed = true;
-          say(`delete: heap #${pv.cell.hid} is freed. Any pointer still holding its address is now dangling`);
+          let c = pv.cell;
+          if (c.past) err('delete was given the address one past the end of an array. Only the exact address that new returned can be deleted.', e.line);
+          if (!c.heapCell) { // a pointer to element 0 of a new[] array
+            const h = homeOf(c), o = h && h.owner;
+            if (o && o.heapCell) {
+              if (h.items[0] !== c) err(`This pointer points into the middle of heap #${o.hid} (element ${c.ix}). delete[] must be given the address of element 0: the exact address new[] returned.`, e.line);
+              c = o;
+            }
+          }
+          if (!c.heapCell) err('delete only works on memory that was created with new.', e.line);
+          if (c.freed) err('Double delete! This memory was already deleted once. That crashes real programs.' + (top() && top().def && top().def.isDtor ? ' Here a destructor deletes memory that was already deleted: a sign that two objects shared one pointer after a shallow copy. A copy constructor that makes a deep copy fixes this.' : ''), e.line);
+          if (c.isArr && !e.arr) say(`⚠ heap #${c.hid} was made with new[], so it should be freed with delete[] (with the brackets)`);
+          else if (!c.isArr && e.arr) say(`⚠ heap #${c.hid} was made with plain new, so it should be freed with delete (no brackets)`);
+          destroyVal(c, e.line, `heap #${c.hid}`);
+          markFreed(c);
+          say(`delete: heap #${c.hid} is freed. Any pointer still holding its address is now dangling`);
           return VOID;
         }
         case 'construct': {
           const cls = prog.classes[e.cls];
-          const c = cell(shell(cls));
+          const c = cell(shell(cls), { ty: { name: cls.name } });
+          stackAlloc(c, false);
           construct(cls, c, e.args, e.line, `a temporary ${e.cls}`);
           return c.val;
         }
         case 'cast': return convert(evalE(e.e), e.ty, e.line);
+        case 'val': return e.v;
+        case 'sizeof': {
+          if (e.ty) return I(sizeTy(e.ty));
+          if (e.e.k === 'id') {
+            const v = top() && [...top().vars].reverse().find(x => x.name === e.e.name);
+            if (v && v.arrParam) { say(`Inside the function, ${e.e.name} is really a pointer, so sizeof gives 8 (the size of an address), not the size of the whole array`); return I(8); }
+          }
+          return I(sizeV(lval(e.e)));
+        }
         case 'list': return err('A { } list can only be used when creating a variable.', e.line);
       }
       return err('This expression isn\'t supported by this visualizer yet.', e.line);

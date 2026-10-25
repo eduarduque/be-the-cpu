@@ -1,649 +1,398 @@
-// trace.js: paste any C++ program, run it with cpp.js, and step through the recorded trace on top of the code.
+// trace.js: run a C++ program with cpp.js and watch the recorded trace like a visual debugger.
+// Panels (code, variables, arrays, memory map, changes, explanation, output) can each be shown or hidden.
 (() => {
-  const STORE = 'be-the-cpu:code';
-  const load = () => { try { return JSON.parse(localStorage.getItem(STORE)); } catch { return null; } };
-  const save = v => { try { localStorage.setItem(STORE, JSON.stringify(v)); } catch {} };
-  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const VIEW = 'be-the-cpu:view';
+  const DEFAULT_SHOW = { inline: true, vars: true, arrays: true, memory: true, addr: true, changes: true, explain: true, output: true };
+  const PANELS = [
+    ['inline', 'Values in code', 'Show each variable next to the line that created it'],
+    ['vars', 'Variables', 'Every variable in every function call (the call stack) and on the heap'],
+    ['arrays', 'Array boxes', 'Arrays drawn as numbered boxes, with index variables and pointers tagged'],
+    ['memory', 'Memory map', 'Every byte range in use: address, name, value'],
+    ['addr', 'Addresses', 'Show memory addresses next to values everywhere'],
+    ['changes', 'What changed', 'Added, changed, increased, decreased and removed values after each line'],
+    ['explain', 'Explanation', 'Plain-English description of what the line did'],
+    ['output', 'Output', 'What the program printed'],
+  ];
+  const SPEEDS = { slow: 2200, normal: 1300, fast: 600 };
+  const TAG_COLORS = ['amber', 'cyan', 'emerald', 'rose', 'violet', 'sky'];
+  const loadView = () => { try { return JSON.parse(localStorage.getItem(VIEW)) || {}; } catch { return {}; } };
+  const saveView = () => { try { localStorage.setItem(VIEW, JSON.stringify({ show, speed })); } catch {} };
 
-  const EXAMPLES = {
-    'Bank account': `#include <iostream>
-#include <string>
-using namespace std;
-
-class BankAccount {
-private:
-    string ownerName;
-
-public:
-    // Constructor
-    BankAccount(string name) : ownerName(name) {}
-
-    // Method declaration inside the class
-    string getOwnerName() const;
-};
-
-// Method definition after the class
-string BankAccount::getOwnerName() const
-{
-    return ownerName;
-}
-
-int main() {
-    BankAccount user1("Alice Smith");
-    cout << "Owner: " << user1.getOwnerName() << endl;
-    return 0;
-}`,
-    'Functions': `#include <iostream>
-using namespace std;
-
-int doubleIt(int x) {
-    x = x * 2;
-    return x;
-}
-
-void addTen(int& score) {
-    score = score + 10;
-}
-
-int main() {
-    int n = 4;
-    int result = doubleIt(n);
-    addTen(n);
-    cout << n << " " << result << endl;
-    return 0;
-}`,
-    'Loop + vector': `#include <iostream>
-#include <vector>
-using namespace std;
-
-int main() {
-    vector<int> scores = {72, 95, 88};
-    scores.push_back(60);
-
-    int best = scores[0];
-    for (int i = 1; i < scores.size(); i++) {
-        if (scores[i] > best) {
-            best = scores[i];
-        }
-    }
-    cout << "Best: " << best << endl;
-    return 0;
-}`,
-    'Pointers': `#include <iostream>
-using namespace std;
-
-struct Node {
-    int value;
-    Node* next;
-};
-
-int main() {
-    Node* head = nullptr;
-    for (int i = 3; i >= 1; i--) {
-        Node* n = new Node;
-        n->value = i * 10;
-        n->next = head;
-        head = n;
-    }
-
-    int total = 0;
-    for (Node* cur = head; cur != nullptr; cur = cur->next) {
-        total += cur->value;
-    }
-    cout << "Total: " << total << endl;
-
-    while (head != nullptr) {
-        Node* old = head;
-        head = head->next;
-        delete old;
-    }
-    return 0;
-}`,
-    'Recursion': `#include <iostream>
-using namespace std;
-
-int factorial(int n) {
-    if (n <= 1) {
-        return 1;
-    }
-    return n * factorial(n - 1);
-}
-
-int main() {
-    int answer = factorial(4);
-    cout << answer << endl;
-    return 0;
-}`,
-    'Input': `#include <iostream>
-#include <string>
-using namespace std;
-
-int main() {
-    string name;
-    int age;
-    cout << "Name and age? ";
-    cin >> name >> age;
-    if (age >= 18) {
-        cout << name << " can vote." << endl;
-    } else {
-        cout << name << " can vote in " << 18 - age << " years." << endl;
-    }
-    return 0;
-}`,
-  };
-  const EXAMPLE_INPUT = { Input: 'Ana 16' };
-
-  // ---------- sharing ----------
   const enc = obj => btoa(unescape(encodeURIComponent(JSON.stringify(obj)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const dec = s => JSON.parse(decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/')))));
+  const hex = n => (n == null ? '' : '0x' + n.toString(16));
+  const showNL = s => s.replace(/\n/g, '↵');
 
-  // ---------- editor ----------
-  function mountEditor(el) {
-    const { esc } = window.BTC;
-    const saved = load() || { c: EXAMPLES['Bank account'], i: '' };
-    el.innerHTML = `
-      <section class="paste">
-        <div class="paste-h">
-          <h2>Paste your code</h2>
-          <div class="examples"><span class="muted">or try:</span>${Object.keys(EXAMPLES).map(n => `<button class="chip" data-ex="${esc(n)}">${esc(n)}</button>`).join('')}</div>
-        </div>
-        <textarea id="src" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="C++ code"></textarea>
-        <div class="inbox" id="inbox">
-          <label for="stdin">⌨ Input for <code>cin</code> (what the user would type)</label>
-          <textarea id="stdin" rows="2" spellcheck="false"></textarea>
-        </div>
-        <div id="cerr" class="cerr" hidden></div>
-        <div class="paste-f">
-          <span class="muted small">Works with beginner C++: classes and structs, functions, references, pointers, <code>new</code>/<code>delete</code>, <code>vector</code>, <code>string</code>, loops, recursion, <code>cin</code>/<code>cout</code>.</span>
-          <button class="primary big" id="go">▶ Step through it</button>
-        </div>
-      </section>`;
-    const src = el.querySelector('#src'), stdin = el.querySelector('#stdin'), inbox = el.querySelector('#inbox');
-    src.value = saved.c; stdin.value = saved.i || '';
-    const syncInput = () => { inbox.hidden = !/\bcin\b|getline/.test(src.value); };
-    syncInput();
-    src.addEventListener('input', () => { syncInput(); el.querySelector('#cerr').hidden = true; });
-    src.addEventListener('keydown', e => {
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        const a = src.selectionStart;
-        src.setRangeText('    ', a, src.selectionEnd, 'end');
-      }
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) el.querySelector('#go').click();
-    });
-    el.querySelectorAll('[data-ex]').forEach(b => (b.onclick = () => {
-      src.value = EXAMPLES[b.dataset.ex];
-      stdin.value = EXAMPLE_INPUT[b.dataset.ex] || '';
-      syncInput();
-      el.querySelector('#cerr').hidden = true;
-    }));
-    el.querySelector('#go').onclick = () => {
-      const res = start(src.value, stdin.value, true);
-      if (res && res.error) {
-        const box = el.querySelector('#cerr');
-        const lineText = src.value.split('\n')[res.error.line - 1];
-        box.innerHTML = `<b>Line ${res.error.line}:</b> ${esc(res.error.msg)}${lineText != null ? `<pre>${res.error.line} | ${esc(lineText)}</pre>` : ''}`;
-        box.hidden = false;
-        box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      }
-    };
-  }
+  let R, code, input, meta, lines, k, flat, prevFlat, changes, autoTimer;
+  const saved = loadView();
+  let show = { ...DEFAULT_SHOW, ...(saved.show || {}) };
+  let speed = saved.speed || 'normal';
 
-  // ---------- trace view state ----------
-  let R, code, input, lines, toks, k, mode, board, done, carried, seen, score, feedback, revealed, autoTimer, busy;
-
-  function start(c, i, fromEditor) {
+  // ---------- opening ----------
+  function open(c, i, m = {}) {
     const res = window.CPP.run(c, i);
-    save({ c, i });
     if (res.compileError) return { error: res.compileError };
     if (!res.steps.length) return { error: res.error || { msg: 'Nothing ran.', line: 1 } };
-    R = res; code = c; input = i;
+    R = res; code = c; input = i; meta = m;
     lines = c.split('\n');
-    toks = lines.map(window.BTC.tokenize);
-    k = 0; mode = mode || 'predict';
-    done = {}; carried = {}; seen = {}; score = { ok: 0, bad: 0 }; feedback = ''; revealed = false; busy = false;
     stopAuto();
-    if (fromEditor) { try { history.replaceState(null, '', '#code=' + enc({ c, i })); } catch {} }
+    if (m.share) { try { history.replaceState(null, '', '#code=' + enc({ c, i })); } catch {} }
     view();
+    go(Math.min(m.at || 0, R.steps.length - 1));
     return null;
   }
-
-  function openShared(hash) {
+  function openShared(hash, at) {
     try {
       const { c, i } = dec(hash);
-      const res = start(c, i || '', false);
-      if (res && res.error) { save({ c, i }); return false; }
-      return true;
+      window.BTC.save({ c, i: i || '' });
+      const res = open(c, i || '', { title: 'Shared program', share: false, at });
+      return !(res && res.error);
     } catch { return false; }
   }
 
-  function view() {
-    const { esc } = window.BTC;
-    const width = Math.max(...lines.map(l => l.length), 20) + 2;
-    const hasHeap = R.steps.some(s => s.heap.length);
-    const app = document.getElementById('app');
-    app.innerHTML = `
-      <div class="level trace">
-        <header class="topbar">
-          <button class="ghostbtn" data-act="edit">← Edit code</button>
-          <div class="ttl">Your program <small>${R.steps.length} steps${R.error ? ' · ends in a crash' : ''}</small></div>
-          <div class="modes" role="group" aria-label="Mode">
-            <button data-mode="predict" class="${mode === 'predict' ? 'on' : ''}" title="Answer questions as you go">🎮 Predict</button>
-            <button data-mode="watch" class="${mode === 'watch' ? 'on' : ''}" title="Just step through">👀 Watch</button>
-          </div>
-          <span class="score" id="score"></span>
-        </header>
-        <div class="scrub">
-          <button class="ghostbtn" data-act="restart" title="Back to the start">⏮</button>
-          <button class="ghostbtn" data-act="auto" id="autobtn" title="Play automatically (space)">▶ Auto</button>
-          <input type="range" id="scrub" min="0" max="${R.steps.length - 1}" value="0" aria-label="Step">
-          <span class="muted small" id="stepno"></span>
-          <button class="ghostbtn" data-act="share" title="Copy a link to this exact program">🔗 Share</button>
-        </div>
-        <div class="legend">
-          <span><span class="cpu">CPU</span> line about to run</span>
-          <span>📋 clipboard (stack frame)</span>
-          <span>🚩 return here</span>
-          <span>📎 reference</span>
-          <span>→ pointer (hover it)</span>
-          <span>🔒 private</span>
-        </div>
-        <main class="board" id="board" style="--codew:${width}ch"></main>
-        ${hasHeap ? '<section class="heap"><div class="heap-h">🏘 Heap: memory made with <code>new</code></div><div id="heap"></div></section>' : ''}
-        <section class="screen">
-          <div class="screen-h">🖥 Screen</div>
-          <div id="screen"></div>
-        </section>
-      </div>`;
-    board = document.getElementById('board');
-    app.querySelector('.level').addEventListener('click', onClick);
-    board.addEventListener('mouseover', onHover);
-    board.addEventListener('mouseout', onHover);
-    document.getElementById('heap')?.addEventListener('mouseover', onHover);
-    document.getElementById('heap')?.addEventListener('mouseout', onHover);
-    document.getElementById('scrub').addEventListener('input', e => { stopAuto(); go(+e.target.value, false); });
-    render();
-    window.scrollTo(0, 0);
+  // ---------- snapshot helpers ----------
+  // Flatten a snapshot into id -> entry for every storage cell (vars, fields, slots, heap blocks).
+  function flatten(s) {
+    const m = new Map();
+    const walk = (label, d, x, parent, depth) => {
+      if (x.id == null) return;
+      m.set(x.id, { id: x.id, label, d, addr: x.addr, size: x.size, ty: x.ty, where: x.where, frame: x.frame, parent, depth, text: textOf(d) });
+      if (d.t === 'obj') d.fields.forEach(f => walk(`${label}.${f.name}`, f.val, { ...f, where: x.where, frame: x.frame }, x.id, depth + 1));
+      if (d.t === 'vec') d.items.forEach((it, i) => walk(`${label}[${i}]`, it.val, { ...it, where: x.where, frame: x.frame }, x.id, depth + 1));
+    };
+    s.globals.forEach(v => { if (!v.ref && !v.isThis) walk(v.name, v.val, { ...v, where: 'globals' }, null, 0); });
+    s.frames.forEach(f => f.vars.forEach(v => { if (!v.ref && !v.isThis) walk(v.name, v.val, { ...v, where: `${f.label}()`, frame: f.uid }, null, 0); }));
+    s.heap.forEach(h => { if (!h.freed) walk(`heap #${h.hid}`, h.val, { ...h, where: 'heap' }, null, 0); });
+    return m;
   }
-
-  // ---------- questions ----------
-  function stmtNext(line) {
-    for (const l of R.stmtLines) if (l > line) return l;
-    return null;
-  }
-  function questionFor(i) {
-    if (mode !== 'predict' || done[i]) return null;
-    const a = R.steps[i], b = R.steps[i + 1];
-    if (!b || b.kind === 'error' || b.kind === 'exit') return null;
-    const sequential = b.frames.length === a.frames.length && b.line === stmtNext(a.line) && b.kind !== 'return';
-    if (!sequential && b.line !== a.line) {
-      const key = `j${a.line}>${b.line}`;
-      if ((seen[key] || 0) < 2) return { type: 'line', line: b.line, key, kind: b.kind, back: b.line < a.line && b.frames.length === a.frames.length };
-    }
-    if (sequential && b.out.length > a.out.length && /\bcout\b/.test(lines[a.line - 1] || '')) {
-      const key = `p${a.line}`;
-      if ((seen[key] || 0) < 2) {
-        const options = printOptions(a.line, b.out.slice(a.out.length));
-        if (options.length >= 2) return { type: 'print', options, answer: options.correct, key };
-      }
-    }
-    return null;
-  }
-  function printOptions(line, printed) {
-    const set = [printed];
-    const m = (lines[line - 1] || '').match(/cout\s*<<(.*?);?\s*$/);
-    if (m) {
-      const literal = m[1].split('<<').map(s => s.trim()).filter(Boolean).map(p => {
-        if (p === 'endl' || p === 'std::endl') return '\n';
-        if (/^".*"$/.test(p)) return p.slice(1, -1).replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-        if (/^'.'$/.test(p)) return p[1];
-        return p;
-      }).join('');
-      set.push(literal);
-    }
-    const nm = printed.match(/-?\d+(\.\d+)?/);
-    if (nm) set.push(printed.replace(nm[0], String(Number(nm[0]) + 1)));
-    else if (printed.trim().length > 1) set.push(printed.replace(/\S+\s*$/, '').trim() ? printed.replace(/\S+(\s*)$/, '$1') : printed + printed);
-    const uniq = [...new Set(set)].filter(s => s !== '').slice(0, 3);
-    // stable shuffle so the right answer isn't always first
-    const rot = line % uniq.length;
-    const opts = uniq.slice(rot).concat(uniq.slice(0, rot));
-    opts.correct = opts.indexOf(printed);
-    return opts;
-  }
-  function carryFor(i) {
-    if (mode !== 'predict' || carried[i]) return null;
-    const s = R.steps[i];
-    if (s.kind !== 'call' || s.frames.length < 2) return null;
-    const f = s.frames[s.frames.length - 1];
-    const v = f.vars.find(x => !x.isThis && !x.ref && x.anchor === s.line && x.val.t === 'p');
-    if (!v) return null;
-    const key = `c${f.uid}`;
-    if ((seen[key] || 0) >= 2) return null;
-    let afterParen = false, occ = null;
-    for (const x of toks[s.line - 1] || []) {
-      if (x.t === '(') afterParen = true;
-      if (afterParen && x.k === 'id' && x.t === v.name) { occ = x.occ; break; }
-    }
-    if (occ == null) return null;
-    return { type: 'carry', name: v.name, value: v.val.text, fn: f.label, line: s.line, occ, key, varId: v.id };
-  }
-
-  // ---------- rendering ----------
-  function regionOf(n) {
-    let best = null;
-    for (const r of R.regions) if (n >= r.start && n <= r.end && (!best || r.end - r.start < best.end - best.start)) best = r;
-    return best;
-  }
-  function valHTML(d) {
-    const { esc } = window.BTC;
+  function textOf(d) {
     switch (d.t) {
-      case 'p': return `<span class="val">${esc(d.text)}</span>`;
-      case 'u': return '<span class="val garbage" title="Declared, but never given a value. Real C++ would hold random garbage here.">?</span>';
+      case 'p': return d.text;
+      case 'u': return '?';
       case 'ptr':
-        if (d.dangling) return `<span class="ptr bad" title="This address was deleted">⚠ dangling (#${d.heap} deleted)</span>`;
-        if (!d.target) return '<span class="ptr null">nullptr</span>';
-        return `<span class="ptr" data-tid="${d.tid}" title="Holds the address of ${esc(d.target)}">→ ${esc(d.target)}</span>`;
-      case 'obj':
-        return `<span class="obj"><span class="objtag">🏠 ${esc(d.cls)}</span>${d.fields.map(f =>
-          `<span class="field" data-cid="${f.id}">${f.priv ? '🔒' : ''}<i>${esc(f.name)}</i>${valHTML(f.val)}</span>`).join('')}</span>`;
-      case 'vec':
-        return `<span class="vec">${d.items.length ? d.items.map((it, i) => `<span class="slot" data-cid="${it.id}"><sub>${i}</sub>${valHTML(it.val)}</span>`).join('') : '<span class="empty">empty</span>'}${d.more ? `<span class="empty">+${d.more} more</span>` : ''}</span>`;
+        if (d.dangling) return `dangling${d.to != null ? ' ' + hex(d.to) : ''}`;
+        if (!d.target) return 'nullptr';
+        return d.to != null ? hex(d.to) : `→ ${d.target}`;
+      case 'obj': return `{${d.fields.map(f => textOf(f.val)).join(', ')}}`;
+      case 'vec': return `[${d.items.map(it => textOf(it.val)).join(', ')}${d.more ? ', …' : ''}]`;
     }
     return '';
   }
-  function chip(v, key, dim) {
-    const { esc } = window.BTC;
-    const body = v.ref ? `<span class="ref" title="A reference: another name for ${esc(v.ref)}">📎 ${esc(v.ref)}</span>${valHTML(v.val)}` : valHTML(v.val);
-    return `<span class="var${dim ? ' dim' : ''}${v.isThis ? ' this' : ''}" data-key="${esc(key)}" data-cid="${v.ref || v.isThis ? '' : v.id}"${dim ? ' title="Still alive, but not visible from the function that is running now"' : ''}><b>${esc(v.name)}</b>${body}</span>`;
-  }
-  const showNL = s => s.replace(/\n/g, '↵');
+  const isLeaf = d => d.t !== 'obj' && d.t !== 'vec';
 
-  function bubbleHTML(s, q, cq) {
-    const { esc } = window.BTC;
-    const last = k === R.steps.length - 1;
+  function diff(a, b, s) {
+    const out = [];
+    if (!a) return out;
+    for (const [id, e] of b) {
+      const o = a.get(id);
+      if (!o) { if (e.parent == null || a.has(e.parent)) out.push({ kind: 'add', e }); continue; }
+      if (!isLeaf(e.d) || o.text === e.text) continue;
+      const x = Number(o.text), y = Number(e.text);
+      if (o.d.t === 'u') out.push({ kind: 'init', e, from: o });
+      else if (e.d.t === 'ptr') out.push({ kind: 'ptr', e, from: o });
+      else if (o.d.t === 'p' && e.d.t === 'p' && o.text !== '' && !isNaN(x) && !isNaN(y)) out.push({ kind: y > x ? 'up' : 'down', e, from: o, delta: y - x });
+      else out.push({ kind: 'set', e, from: o });
+    }
+    const freed = new Set(s.heap.filter(h => h.freed).map(h => h.id));
+    for (const [id, o] of a) {
+      if (b.has(id) || (o.parent != null && !b.has(o.parent))) continue;
+      out.push({ kind: freed.has(id) || o.where === 'heap' ? 'free' : 'gone', e: o });
+    }
+    return out;
+  }
+
+  // ---------- rendering pieces ----------
+  const esc = s => window.BTC.esc(s);
+  const ty = e => (e.ty ? `<span class="ty">${esc(e.ty)}</span>` : '');
+  const addrTag = a => (show.addr && a != null ? `<span class="addr">${hex(a)}</span>` : '');
+  function cls(id) {
+    const c = changes.find(x => x.e.id === id);
+    return c ? (c.kind === 'add' ? ' new' : ' chg') : '';
+  }
+  function valHTML(d, deep = true) {
+    switch (d.t) {
+      case 'p': return `<span class="val">${esc(d.text)}</span>`;
+      case 'u': return '<span class="val garbage" title="Declared but never given a value: real C++ would hold random garbage here">?</span>';
+      case 'ptr':
+        if (d.dangling) return `<span class="ptr bad" title="This memory was deleted: the pointer still holds its old address">⚠ dangling${d.to != null && show.addr ? ' ' + hex(d.to) : ''}</span>`;
+        if (!d.target) return '<span class="ptr null">nullptr</span>';
+        return `<span class="ptr" data-tid="${d.tid}" title="Holds the address of ${esc(d.target)}">${show.addr && d.to != null ? `<span class="addr">${hex(d.to)}</span>` : ''}→ ${esc(d.target)}</span>`;
+      case 'obj':
+        if (!deep) return `<span class="val">${esc(d.cls)}</span>`;
+        return `<span class="obj"><span class="objtag">${esc(d.cls)}</span>${d.fields.map(f =>
+          `<span class="field${cls(f.id)}" data-cid="${f.id}">${f.priv ? '<span title="private">🔒</span>' : ''}<i>${esc(f.name)}</i>${valHTML(f.val)}${addrTag(f.addr)}</span>`).join('')}</span>`;
+      case 'vec':
+        if (!deep) return `<span class="val">[${d.items.length}${d.more ? '+' : ''}]</span>`;
+        return `<span class="vec">${d.items.length ? d.items.map((it, i) => `<span class="slot${cls(it.id)}" data-cid="${it.id}"><sub>${i}</sub>${valHTML(it.val)}</span>`).join('') : '<span class="empty">empty</span>'}${d.more ? `<span class="empty">+${d.more} more</span>` : ''}</span>`;
+    }
+    return '';
+  }
+
+  function codePanel(s) {
     const prevLine = k > 0 ? R.steps[k - 1].line : null;
-    const did = s.did.map(d => (typeof d === 'string'
-      ? `<li>${esc(d)}</li>`
-      : `<li>🖥 Printed <code class="printed">${esc(showNL(d.print))}</code></li>`)).join('');
-    let html = '';
-    if (did) html += `<div class="said">${prevLine ? `<span class="didh">Line ${prevLine}</span>` : ''}<ul>${did}</ul></div>`;
-    if (s.kind === 'error') html += `<div class="crash">💥 <b>The program crashes here.</b> ${esc(s.note)}</div>`;
-    else if (last && R.error) html += `<div class="crash">💥 ${esc(R.error.msg)}</div>`;
-    if (feedback) html += `<div class="fb">${feedback}</div>`;
-    if (cq) {
-      html += `<div class="prompt"><span class="carry">📦 ${esc(cq.value)}</span><span>You carry this into <code>${esc(cq.fn)}()</code>. Tap where it lands.</span><span class="how">👆 tap a word in the code</span></div>`;
-    } else if (q && q.type === 'line') {
-      const prompt = q.kind === 'return' ? 'The function is done. Which line do you go back to?'
-        : q.kind === 'call' ? 'A function is being called. Which line runs next?'
-        : 'Which line runs next?';
-      html += `<div class="prompt"><span>${prompt}</span><span class="how">👆 tap a line</span></div>`;
-    } else if (q && q.type === 'print') {
-      html += `<div class="prompt"><span>This line prints something. What appears on the screen?</span></div>
-        <div class="choices">${q.options.map((o, i) => `<button class="choice mono${revealed && i === q.answer ? ' reveal' : ''}" data-choice="${i}">${esc(showNL(o))}</button>`).join('')}</div>`;
-    } else if (!last) {
-      html += `<div class="prompt quiet"><span>The <span class="cpu">CPU</span> is about to run line ${s.line}.</span></div>`;
+    const flags = {};
+    s.frames.forEach(f => { if (f.callLine != null) flags[f.callLine] = (flags[f.callLine] || 0) + 1; });
+    const top = s.frames[s.frames.length - 1];
+    const ann = {};
+    if (show.inline) {
+      const add = (n, h) => { (ann[n] = ann[n] || []).push(h); };
+      s.globals.forEach(v => add(v.anchor, chip(v, false)));
+      s.frames.forEach((f, fi) => {
+        const isTop = fi === s.frames.length - 1;
+        if (!isTop && top && f.uid === top.uid) return;
+        f.vars.forEach(v => add(v.anchor, chip(v, !isTop)));
+      });
+      if (s.temp) add(s.temp.line, `<span class="chip temp">↩ returned ${valHTML(s.temp.val)}</span>`);
     }
-    if (last) {
-      html += `<div class="prompt">${s.kind === 'exit' ? '✅ The program finished.' : ''}</div>
-        <div class="tools"><button class="ghostbtn" data-act="back">◀ Back</button><button class="ghostbtn" data-act="restart">⏮ Start over</button><button class="primary" data-act="edit">✎ Edit code</button></div>`;
-    } else {
-      const asking = q || cq;
-      html += `<div class="tools">
-        <button class="ghostbtn" data-act="back" ${k === 0 ? 'disabled' : ''}>◀ Back</button>
-        ${asking ? '<button class="ghostbtn" data-act="hint">💡 Show me</button>' : ''}
-        <button class="${asking ? 'ghostbtn' : 'primary'}" data-act="next">${asking ? 'Skip ▶' : 'Next ▶'}</button>
-        <span class="muted small keys">← → keys</span>
+    return lines.map((src, i) => {
+      const n = i + 1;
+      const cur = s.line === n && s.kind !== 'exit';
+      const c = 'row' + (cur ? ' current' : '') + (n === prevLine && !cur ? ' ran' : '') + (s.kind === 'error' && cur ? ' crashed' : '');
+      return `<div class="${c}" data-line="${n}"><span class="ln">${n}</span><span class="mark">${cur ? '▶' : n === prevLine ? '·' : ''}${flags[n] ? '<span class="flag" title="A function call is waiting here to return">🚩</span>' : ''}</span><span class="src">${window.BTC.codeHTML(src) || ' '}</span>${ann[n] ? `<span class="ann">${ann[n].join('')}</span>` : ''}</div>`;
+    }).join('');
+  }
+  function chip(v, dim) {
+    if (v.anchor == null) return '';
+    const body = v.ref ? `<span class="ref" title="A reference: another name for ${esc(v.ref)}">📎 ${esc(v.ref)}</span>` : v.isThis ? valHTML(v.val) : valHTML(v.val, false);
+    return `<span class="chip${dim ? ' dim' : ''}${v.ref || v.isThis ? '' : cls(v.id)}" data-cid="${v.ref || v.isThis ? '' : v.id}"><b>${esc(v.name)}</b>${body}</span>`;
+  }
+
+  function varsPanel(s) {
+    const row = v => {
+      const isRef = !!v.ref;
+      const val = isRef ? `<span class="ref">📎 another name for <b>${esc(v.ref)}</b></span>` : valHTML(v.val);
+      return `<tr class="${isRef || v.isThis ? '' : cls(v.id).trim()}" data-cid="${isRef || v.isThis ? '' : v.id}"><td class="nm">${esc(v.name)}</td><td>${val}</td><td>${ty(v)}</td>${show.addr ? `<td class="addr">${isRef ? '' : hex(v.addr)}</td>` : ''}</tr>`;
+    };
+    const table = (vars, empty) => (vars.length ? `<table class="vt"><tbody>${vars.map(row).join('')}</tbody></table>` : `<p class="muted small">${empty}</p>`);
+    let h = '';
+    s.frames.slice().reverse().forEach((f, i) => {
+      h += `<div class="frame${i === 0 ? ' on' : ''}"><div class="fh">📋 ${esc(f.label)}()<span class="muted small">${i === 0 ? 'running now' : `waiting at line ${s.frames[s.frames.length - i].callLine}`}</span></div>${table(f.vars, 'no variables yet')}</div>`;
+    });
+    if (s.globals.length) h += `<div class="frame"><div class="fh">🌐 globals</div>${table(s.globals, '')}</div>`;
+    if (s.heap.length) {
+      h += `<div class="frame heapf"><div class="fh">🏘 heap <span class="muted small">memory made with new</span></div><table class="vt"><tbody>${s.heap.map(hp => (hp.freed
+        ? `<tr class="freed"><td class="nm">#${hp.hid}</td><td><span class="muted">deleted</span></td><td>${ty(hp)}</td>${show.addr ? `<td class="addr">${hex(hp.addr)}</td>` : ''}</tr>`
+        : `<tr class="${cls(hp.id).trim()}" data-cid="${hp.id}"><td class="nm">#${hp.hid}</td><td>${valHTML(hp.val)}</td><td>${ty(hp)}</td>${show.addr ? `<td class="addr">${hex(hp.addr)}</td>` : ''}</tr>`)).join('')}</tbody></table></div>`;
+    }
+    return h || '<p class="muted small">No variables yet.</p>';
+  }
+
+  // Index variables: identifiers used inside [ ] after a name, e.g. v[maxIndex] -> maxIndex.
+  const indexNames = {};
+  function indexVarsFor(name) {
+    if (indexNames[name]) return indexNames[name];
+    const re = new RegExp(`\\b${name.replace(/[^\w]/g, '')}\\s*\\[\\s*([A-Za-z_]\\w*)\\s*\\]`, 'g');
+    const set = new Set();
+    let m;
+    while ((m = re.exec(code))) set.add(m[1]);
+    return (indexNames[name] = [...set]);
+  }
+  function arraysPanel(s) {
+    const top = s.frames[s.frames.length - 1];
+    const scope = [...(top ? top.vars : []), ...s.globals];
+    const intOf = n => { const v = scope.find(x => x.name === n && !x.isThis); const r = v && v.val.t === 'p' && /^-?\d+$/.test(v.val.text) ? +v.val.text : null; return r; };
+    const pointers = [...flat.values()].filter(e => e.d.t === 'ptr' && e.d.tid != null && e.depth === 0);
+    const arrays = [...flat.values()].filter(e => e.d.t === 'vec' && (e.depth === 0 || flat.get(e.parent)?.d.t === 'obj'));
+    if (!arrays.length) return '<p class="muted small">No arrays or vectors right now.</p>';
+    const colors = {};
+    let ci = 0;
+    const color = n => (colors[n] = colors[n] || TAG_COLORS[ci++ % TAG_COLORS.length]);
+    return arrays.map(a => {
+      const ptrs = pointers.filter(p => p.d.tid === a.id || a.d.items.some(it => it.id === p.d.tid));
+      const names = [a.label.split('.').pop(), ...ptrs.map(p => p.label)];
+      const idx = [];
+      names.forEach(n => indexVarsFor(n).forEach(iv => { const v = intOf(iv); if (v != null && !idx.some(x => x.n === iv)) idx.push({ n: iv, v }); }));
+      const grid2d = a.d.items.length && a.d.items[0].val.t === 'vec';
+      const box = (it, i, extraTags = '') => {
+        const tags = idx.filter(x => x.v === i).map(x => `<span class="tag ${color(x.n)}">${esc(x.n)}</span>`).join('')
+          + ptrs.filter(p => p.d.tid === it.id || (i === 0 && p.d.tid === a.id)).map(p => `<span class="tag ptrtag" title="${esc(p.label)} points here">${esc(p.label)} →</span>`).join('') + extraTags;
+        return `<div class="box${cls(it.id)}" data-cid="${it.id}"><div class="tags">${tags}</div><span class="bi">[${i}]</span><span class="bv">${it.val.t === 'p' ? esc(it.val.text) : it.val.t === 'u' ? '?' : valHTML(it.val)}</span>${show.addr && it.addr != null ? `<span class="ba">${hex(it.addr)}</span>` : ''}</div>`;
+      };
+      const body = grid2d
+        ? a.d.items.map((row, r) => `<div class="boxrow"><span class="rowlbl">[${r}]</span>${row.val.items.map((it, i) => box(it, i)).join('')}</div>`).join('')
+        : `<div class="boxrow">${a.d.items.map((it, i) => box(it, i)).join('')}${a.d.more ? `<span class="muted small">+${a.d.more} more</span>` : ''}</div>`;
+      return `<div class="arr"><div class="arrh"><code>${esc(a.label)}</code>${ty(a)}<span class="muted small">${esc(a.where)}${a.addr != null && show.addr ? ` · starts at ${hex(a.addr)}` : ''}</span></div>${body}</div>`;
+    }).join('');
+  }
+
+  function memoryPanel(s) {
+    const entries = [...flat.values()];
+    const has = entries.some(e => e.addr != null);
+    if (!entries.length) return '<p class="muted small">Nothing in memory yet.</p>';
+    const groups = {};
+    entries.forEach(e => { const g = e.where === 'heap' ? 'Heap (new)' : e.where === 'globals' ? 'Globals' : `Stack · ${e.where}`; (groups[g] = groups[g] || []).push(e); });
+    const freed = s.heap.filter(h => h.freed);
+    if (freed.length) groups['Heap (new)'] = (groups['Heap (new)'] || []).concat(freed.map(h => ({ id: 'f' + h.hid, label: `heap #${h.hid}`, d: { t: 'u' }, addr: h.addr, ty: h.ty, depth: 0, freed: true })));
+    const order = Object.keys(groups).sort((a, b) => (a.startsWith('Stack') ? 0 : a.startsWith('Heap') ? 1 : 2) - (b.startsWith('Stack') ? 0 : b.startsWith('Heap') ? 1 : 2));
+    return `${has ? '' : '<p class="muted small">Addresses are not available for this program.</p>'}<table class="mem"><thead><tr><th>Address</th><th>Name</th><th>Value</th><th>Type</th></tr></thead>${order.map(g => `<tbody><tr class="grp"><td colspan="4">${esc(g)}</td></tr>${groups[g].map(e => `
+      <tr class="${e.freed ? 'freed' : cls(e.id).trim()}" data-cid="${e.freed ? '' : e.id}"><td class="addr">${hex(e.addr)}</td><td class="nm" style="padding-left:${0.5 + e.depth * 0.9}rem">${esc(e.label.slice(e.depth ? Math.max(e.label.lastIndexOf('.'), e.label.lastIndexOf('[')) : 0))}</td><td>${e.freed ? '<span class="muted">deleted</span>' : isLeaf(e.d) ? valHTML(e.d) : `<span class="muted small">${e.size ? e.size + ' bytes' : ''}</span>`}</td><td>${ty(e)}</td></tr>`).join('')}</tbody>`).join('')}</table>`;
+  }
+
+  function changesPanel(s) {
+    const prev = k > 0 ? R.steps[k - 1] : null;
+    const items = changes.map(c => {
+      const e = c.e;
+      const nm = `<code>${esc(e.label)}</code>`;
+      switch (c.kind) {
+        case 'add': return `<li class="c-add"><span class="ic">＋</span>${nm} created${isLeaf(e.d) && e.d.t !== 'u' ? ` = ${valHTML(e.d)}` : e.d.t === 'u' ? ' (no value yet)' : ''}${show.addr && e.addr != null ? ` at <span class="addr">${hex(e.addr)}</span>` : ''}</li>`;
+        case 'init': return `<li class="c-set"><span class="ic">✎</span>${nm} got its first value: ${valHTML(e.d)}</li>`;
+        case 'up': return `<li class="c-up"><span class="ic">▲</span>${nm} increased <span class="old">${esc(c.from.text)}</span> → ${valHTML(e.d)} <span class="delta">+${+c.delta.toFixed(6)}</span></li>`;
+        case 'down': return `<li class="c-down"><span class="ic">▼</span>${nm} decreased <span class="old">${esc(c.from.text)}</span> → ${valHTML(e.d)} <span class="delta">${+c.delta.toFixed(6)}</span></li>`;
+        case 'ptr': return `<li class="c-ptr"><span class="ic">➜</span>${nm} now ${e.d.dangling ? 'holds a dangling address' : e.d.target ? `points to <b>${esc(e.d.target)}</b>${show.addr && e.d.to != null ? ` (<span class="addr">${hex(e.d.to)}</span>)` : ''}` : 'is nullptr'}<span class="old"> was ${esc(c.from.text)}</span></li>`;
+        case 'set': return `<li class="c-set"><span class="ic">✎</span>${nm} changed <span class="old">${esc(c.from.text)}</span> → ${valHTML(e.d)}</li>`;
+        case 'free': return `<li class="c-gone"><span class="ic">🗑</span>${nm} deleted: its memory was given back</li>`;
+        case 'gone': return `<li class="c-gone"><span class="ic">✕</span>${nm} removed (its function or block ended)</li>`;
+      }
+      return '';
+    });
+    if (prev && s.out.length > prev.out.length) items.push(`<li class="c-out"><span class="ic">🖥</span>printed <code class="printed">${esc(showNL(s.out.slice(prev.out.length)))}</code></li>`);
+    if (!prev) return '<p class="muted small">Nothing has run yet. Press Step.</p>';
+    return items.length ? `<ul class="changes">${items.join('')}</ul>` : '<p class="muted small">No values changed on this step.</p>';
+  }
+
+  function explainPanel(s) {
+    const prev = k > 0 ? R.steps[k - 1] : null;
+    let h = '';
+    if (k === 0) h += `<p>The program starts. The CPU is at line <b>${s.line}</b>, the first line of <code>main()</code>.</p>`;
+    if (prev) {
+      const did = s.did.map(d => (typeof d === 'string' ? `<li>${esc(d)}</li>` : `<li>🖥 Printed <code class="printed">${esc(showNL(d.print))}</code></li>`)).join('');
+      h += `<div class="didh">Line ${prev.line} just ran</div><div class="srcline">${window.BTC.codeHTML((lines[prev.line - 1] || '').trim())}</div>${did ? `<ul class="did">${did}</ul>` : ''}`;
+    }
+    if (s.temp) h += `<p class="small">↩ The function handed back ${valHTML(s.temp.val)} to line ${s.temp.line}.</p>`;
+    if (s.kind === 'error') h += `<div class="crash">💥 <b>The program crashes on line ${s.line}.</b> ${esc(s.note || '')}</div>`;
+    else if (s.kind === 'exit') h += `<div class="done">✅ The program finished.</div>`;
+    else h += `<p class="next">Next: line <b>${s.line}</b> <span class="srcline inline">${window.BTC.codeHTML((lines[s.line - 1] || '').trim())}</span></p>`;
+    if (k === R.steps.length - 1 && R.error && s.kind !== 'error') h += `<div class="crash">💥 ${esc(R.error.msg)}</div>`;
+    return h;
+  }
+
+  function outputPanel(s) {
+    return s.out ? s.out.split('\n').map((l, i, a) => (i === a.length - 1 && l === '' ? '' : `<div class="outline">${esc(l) || '&nbsp;'}</div>`)).join('') : '<div class="outline muted">(nothing printed yet)</div>';
+  }
+
+  // ---------- layout ----------
+  function view() {
+    const app = document.getElementById('app');
+    app.innerHTML = `
+      <div class="viewer">
+        <header class="topbar">
+          <button class="ghostbtn" data-act="home">← Programs</button>
+          <div class="ttl">${meta.section ? `<span class="muted small">${esc(meta.section)}</span>` : ''}<b>${esc(meta.title || 'Your program')}</b></div>
+          <div class="topbtns">
+            <button class="ghostbtn" data-act="edit" title="Open this code in the editor">✎ Edit code</button>
+            <button class="ghostbtn" data-act="share" title="Copy a link to this program">🔗 Share</button>
+          </div>
+        </header>
+        ${meta.watch ? `<div class="watchhint">👀 <b>Watch for:</b> ${esc(meta.watch)}</div>` : ''}
+        <div class="controls card">
+          <div class="btns">
+            <button class="ctl" data-act="restart" title="Back to the start (Home)">⏮<span>Reset</span></button>
+            <button class="ctl" data-act="back" id="bback" title="Step back (←)">◀<span>Back</span></button>
+            <button class="ctl primary" data-act="next" id="bnext" title="Step forward (→)">▶<span>Step</span></button>
+            <button class="ctl go" data-act="auto" id="bauto" title="Play automatically (Space)">⏵<span>Auto</span></button>
+            <select id="speed" aria-label="Auto speed">${Object.keys(SPEEDS).map(sp => `<option value="${sp}"${sp === speed ? ' selected' : ''}>${sp}</option>`).join('')}</select>
+          </div>
+          <input type="range" id="scrub" min="0" max="${R.steps.length - 1}" value="0" aria-label="Step">
+          <span class="stepno" id="stepno"></span>
+        </div>
+        <div class="toggles" role="group" aria-label="Show or hide panels"><span class="muted small">Show:</span>
+          ${PANELS.map(([key, label, tip]) => `<button class="tog" data-tog="${key}" aria-pressed="${!!show[key]}" title="${esc(tip)}">${esc(label)}</button>`).join('')}
+        </div>
+        <main class="grid">
+          <section class="card codecard"><div class="card-h"><h3>Code</h3><span class="muted small">▶ runs next · · just ran · 🚩 waiting for a call to return</span></div><div class="code" id="code"></div></section>
+          <div class="side">
+            <section class="card" data-panel="explain"><div class="card-h"><h3>Explanation</h3></div><div id="p-explain" class="explain"></div></section>
+            <section class="card" data-panel="changes"><div class="card-h"><h3>What changed</h3></div><div id="p-changes"></div></section>
+            <section class="card" data-panel="vars"><div class="card-h"><h3>Variables</h3><span class="muted small">call stack, top = running</span></div><div id="p-vars"></div></section>
+            <section class="card" data-panel="arrays"><div class="card-h"><h3>Array boxes</h3><span class="muted small">index = box number · value = what's inside</span></div><div id="p-arrays"></div></section>
+            <section class="card" data-panel="memory"><div class="card-h"><h3>Memory map</h3></div><div id="p-memory"></div></section>
+            <section class="card" data-panel="output"><div class="card-h"><h3>Output</h3></div><div id="p-output" class="screen"></div></section>
+          </div>
+        </main>
       </div>`;
-    }
-    return `<div class="bubble" id="bubble">${html}</div>`;
+    app.querySelector('.viewer').addEventListener('click', onClick);
+    app.querySelector('.viewer').addEventListener('mouseover', onHover);
+    app.querySelector('.viewer').addEventListener('mouseout', onHover);
+    document.getElementById('scrub').addEventListener('input', e => { stopAuto(); go(+e.target.value); });
+    document.getElementById('speed').addEventListener('change', e => { speed = e.target.value; saveView(); if (autoTimer) { stopAuto(); toggleAuto(); } });
+    for (const key in indexNames) delete indexNames[key];
+    window.scrollTo(0, 0);
   }
 
   function render() {
-    const { esc } = window.BTC;
     const s = R.steps[k];
-    const top = s.frames[s.frames.length - 1];
-    const topUid = top ? top.uid : null;
-    const live = new Set(s.frames.map(f => f.uid));
-    const flags = {};
-    s.frames.forEach(f => { if (f.callLine != null) flags[f.callLine] = (flags[f.callLine] || 0) + 1; });
-    const hidden = s.frames.filter((f, i) => i < s.frames.length - 1 && f.uid === topUid);
-    const cq = carryFor(k);
-    const q = cq ? null : questionFor(k);
-
-    let html = '';
-    lines.forEach((src, i) => {
-      const n = i + 1;
-      const r = regionOf(n);
-      let cls = 'row';
-      if (!r) cls += ' outside';
-      else if (r.kind === 'class') cls += ' blueprint';
-      else if (r.uid === topUid) cls += ' active';
-      else if (live.has(r.uid)) cls += ' waiting';
-      else cls += ' idle';
-      if (s.line === n && s.kind !== 'exit') cls += ' current';
-      if (s.kind === 'error' && s.line === n) cls += ' crashed';
-      if (q && q.type === 'line') cls += ' pickable';
-      if (cq) cls += ' tokpick';
-
-      const gut = `<span class="ln">${n}</span>${s.line === n && s.kind !== 'exit' ? '<span class="cpu">CPU</span>' : ''}${flags[n] ? `<span class="flag" title="A call is waiting here for its function to return">🚩${flags[n] > 1 ? '×' + flags[n] : ''}</span>` : ''}`;
-      const codeHTML = toks[i].map(tk => (tk.k === 'ws' ? tk.t : `<span class="tk t-${tk.k}" data-t="${esc(tk.t)}" data-occ="${tk.occ}">${esc(tk.t)}</span>`)).join('');
-
-      let ann = '';
-      if (r && r.start === n) {
-        const f = r.uid && s.frames.slice().reverse().find(x => x.uid === r.uid);
-        if (f) ann += `<span class="clip ${r.uid === topUid ? 'on' : ''}">📋 ${esc(f.label)}()${r.uid === topUid ? '' : ' · waiting'}</span>`;
-        else if (r.label) ann += `<span class="rlabel">${esc(r.label)}</span>`;
-      }
-      s.globals.filter(v => v.anchor === n).forEach(v => { ann += chip(v, `g:${v.name}`, false); });
-      s.frames.forEach((f, fi) => {
-        const isTop = fi === s.frames.length - 1;
-        if (!isTop && f.uid === topUid) return;
-        f.vars.filter(v => v.anchor === n).forEach(v => {
-          if (cq && isTop && v.id === cq.varId) return;
-          ann += chip(v, `${fi}:${v.name}:${v.anchor}`, !isTop);
-        });
-      });
-      if (hidden.length && r && r.uid === topUid && r.start === n) {
-        ann += `<span class="stackbadge" title="Earlier calls of this same function, waiting underneath">📋×${hidden.length} waiting below: ${hidden.map(f => f.vars.filter(v => !v.isThis && v.val.t === 'p').map(v => `${esc(v.name)}=${esc(v.val.text)}`).join(', ') || esc(f.label)).join(' · ')}</span>`;
-      }
-      if (s.temp && s.temp.line === n) ann += `<span class="temp" data-key="t">📦 returned ${valHTML(s.temp.val)}</span>`;
-
-      html += `<div class="${cls}" data-line="${n}"><div class="gut">${gut}</div><div class="code">${codeHTML || ' '}</div><div class="ann">${ann}</div></div>`;
-      if (s.line === n) html += `<div class="bubblerow">${bubbleHTML(s, q, cq)}</div>`;
-    });
-    board.innerHTML = html;
-
-    const heapEl = document.getElementById('heap');
-    if (heapEl) {
-      heapEl.innerHTML = s.heap.length
-        ? s.heap.map(h => (h.freed
-          ? `<span class="heapitem freed" title="Deleted">🏚 #${h.hid} deleted</span>`
-          : `<span class="heapitem" data-cid="${h.id}" data-key="h:${h.hid}"><b>#${h.hid}</b>${valHTML(h.val)}</span>`)).join('')
-        : '<span class="muted small">(empty: nothing has been created with new yet)</span>';
-    }
-    const scr = document.getElementById('screen');
-    scr.innerHTML = s.out ? s.out.split('\n').map((l, i, a) => (i === a.length - 1 && l === '' ? '' : `<div class="outline">${esc(l) || '&nbsp;'}</div>`)).join('') : '<div class="outline muted">(nothing printed yet)</div>';
-    document.getElementById('stepno').textContent = `step ${k + 1} / ${R.steps.length}`;
+    document.querySelectorAll('[data-panel]').forEach(p => (p.hidden = !show[p.dataset.panel]));
+    document.querySelectorAll('[data-tog]').forEach(b => b.setAttribute('aria-pressed', !!show[b.dataset.tog]));
+    const codeEl = document.getElementById('code');
+    codeEl.innerHTML = codePanel(s);
+    const set = (id, on, fn) => { if (on) document.getElementById(id).innerHTML = fn(s); };
+    set('p-explain', show.explain, explainPanel);
+    set('p-changes', show.changes, changesPanel);
+    set('p-vars', show.vars, varsPanel);
+    set('p-arrays', show.arrays, arraysPanel);
+    set('p-memory', show.memory, memoryPanel);
+    set('p-output', show.output, outputPanel);
+    document.getElementById('stepno').textContent = `Step ${k + 1} / ${R.steps.length}`;
     document.getElementById('scrub').value = k;
-    document.getElementById('score').innerHTML = mode === 'predict' ? `<span class="ok">✓ ${score.ok}</span> <span class="bad">✗ ${score.bad}</span>` : '';
-    const ab = document.getElementById('autobtn');
-    ab.textContent = autoTimer ? '⏸ Pause' : '▶ Auto';
-
-    if (revealed) {
-      if (cq) board.querySelector(`.row[data-line="${cq.line}"] .tk[data-t="${CSS.escape(cq.name)}"][data-occ="${cq.occ}"]`)?.classList.add('reveal');
-      else if (q && q.type === 'line') board.querySelector(`.row[data-line="${q.line}"]`)?.classList.add('reveal');
-    }
-  }
-
-  function scrollToCurrent() {
-    const b = document.getElementById('bubble');
-    if (!b) return;
-    const r = b.getBoundingClientRect();
-    if (r.bottom > innerHeight - 40 || r.top < 60) b.scrollIntoView({ block: 'center', behavior: autoTimer ? 'auto' : 'smooth' });
-  }
-
-  // ---------- animation ----------
-  function chipState() {
-    const m = new Map();
-    document.querySelectorAll('[data-key]').forEach(el => {
-      const r = el.getBoundingClientRect();
-      m.set(el.dataset.key, { html: el.outerHTML, text: el.textContent, rect: r });
-    });
-    return m;
-  }
-  function animateDiff(prevStep, before) {
-    const flyFrom = board.querySelector(`.row[data-line="${prevStep.line}"] .code`);
-    if (!flyFrom) return;
-    const src = flyFrom.getBoundingClientRect();
-    const srcRect = { left: src.left, top: src.top, width: Math.min(src.width, 200), height: src.height };
-    let flies = 0;
-    document.querySelectorAll('[data-key]').forEach(el => {
-      const old = before.get(el.dataset.key);
-      if (old && old.text === el.textContent) return;
-      if (flies++ >= 4) return;
-      const label = el.querySelector('.val, .ptr')?.textContent || '📦';
-      window.BTC.flyGhost(srcRect, el, label);
-    });
-    const s = R.steps[k];
-    if (s.out.length > prevStep.out.length) {
-      const scr = document.getElementById('screen');
-      window.BTC.flyGhost(srcRect, scr.lastElementChild || scr, showNL(s.out.slice(prevStep.out.length)).slice(0, 24));
-    }
-    // shred anything that disappeared
-    const now = new Set([...document.querySelectorAll('[data-key]')].map(e => e.dataset.key));
-    for (const [key, old] of before) {
-      if (now.has(key)) continue;
-      const g = document.createElement('div');
-      g.innerHTML = old.html;
-      const el = g.firstElementChild;
-      el.classList.add('shredghost');
-      Object.assign(el.style, { position: 'fixed', left: old.rect.left + 'px', top: old.rect.top + 'px', margin: 0, zIndex: 40, pointerEvents: 'none' });
-      document.body.appendChild(el);
-      setTimeout(() => el.remove(), 600);
+    document.getElementById('bback').disabled = k === 0;
+    document.getElementById('bnext').disabled = k === R.steps.length - 1;
+    document.getElementById('bauto').innerHTML = autoTimer ? '⏸<span>Pause</span>' : '⏵<span>Auto</span>';
+    const cur = codeEl.querySelector('.row.current') || codeEl.querySelector('.row.ran');
+    if (cur) {
+      const top = cur.offsetTop - codeEl.offsetTop, h = codeEl.clientHeight;
+      if (top < codeEl.scrollTop + 20 || top > codeEl.scrollTop + h - 40) codeEl.scrollTo({ top: top - h / 3, behavior: autoTimer ? 'auto' : 'smooth' });
     }
   }
 
   // ---------- navigation ----------
-  function go(i, animate) {
+  function go(i) {
     if (i < 0 || i >= R.steps.length) return;
-    const prev = R.steps[k];
-    const before = animate && i === k + 1 ? chipState() : null;
     k = i;
-    feedback = '';
-    revealed = false;
+    flat = flatten(R.steps[k]);
+    prevFlat = k > 0 ? flatten(R.steps[k - 1]) : null;
+    changes = diff(prevFlat, flat, R.steps[k]);
     render();
-    if (before) animateDiff(prev, before);
-    scrollToCurrent();
     if (k === R.steps.length - 1) stopAuto();
-  }
-  function next() {
-    if (busy) return;
-    if (carryFor(k)) { carried[k] = 'skipped'; render(); return; }
-    if (questionFor(k)) done[k] = 'skipped';
-    go(k + 1, true);
   }
   function stopAuto() {
     if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
-    const ab = document.getElementById('autobtn');
-    if (ab) ab.textContent = '▶ Auto';
+    const b = document.getElementById('bauto');
+    if (b) b.innerHTML = '⏵<span>Auto</span>';
   }
   function toggleAuto() {
     if (autoTimer) return stopAuto();
-    if (mode === 'predict') { mode = 'watch'; document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('on', b.dataset.mode === 'watch')); }
-    if (k === R.steps.length - 1) go(0, false);
-    autoTimer = setInterval(() => (k >= R.steps.length - 1 ? stopAuto() : go(k + 1, true)), 1300);
+    if (k === R.steps.length - 1) go(0);
+    autoTimer = setInterval(() => (k >= R.steps.length - 1 ? stopAuto() : go(k + 1)), SPEEDS[speed]);
     render();
-  }
-
-  async function right(q) {
-    score.ok++;
-    seen[q.key] = (seen[q.key] || 0) + 1;
-    if (q.type === 'carry') {
-      carried[k] = true;
-      busy = true;
-      render();
-      const prev = R.steps[k - 1];
-      const from = prev && board.querySelector(`.row[data-line="${prev.line}"] .code`);
-      const to = board.querySelector(`.var[data-key^="${R.steps[k].frames.length - 1}:${CSS.escape(q.name)}:"]`);
-      if (from && to) { const r = from.getBoundingClientRect(); await window.BTC.flyGhost({ left: r.left, top: r.top, width: Math.min(r.width, 200), height: r.height }, to, q.value); }
-      busy = false;
-      return;
-    }
-    done[k] = true;
-    go(k + 1, true);
-  }
-  function wrongAnswer(msg, el) {
-    score.bad++;
-    feedback = '✗ ' + msg;
-    render();
-    const target = typeof el === 'function' ? el() : el;
-    if (target) { target.classList.add('nope'); setTimeout(() => target.classList.remove('nope'), 600); }
-  }
-  function lineHint(q) {
-    if (q.kind === 'return') return 'Not that one. Follow the 🚩: it marks the line that made the call.';
-    if (q.kind === 'call') return 'Not that one. This line calls a function, so the CPU jumps to where that function is written.';
-    if (q.back) return 'Not that one. At the end of a loop body, the CPU goes back to check the loop condition again.';
-    return 'Not that one. Check the condition: is it true or false? That decides which line runs next.';
   }
 
   function onClick(e) {
+    const t = e.target.closest('[data-tog]');
+    if (t) { show[t.dataset.tog] = !show[t.dataset.tog]; saveView(); return render(); }
     const act = e.target.closest('[data-act]');
-    if (act) {
-      const a = act.dataset.act;
-      if (a === 'next') return next();
-      if (a === 'back') { stopAuto(); return go(k - 1, false); }
-      if (a === 'restart') { stopAuto(); done = {}; carried = {}; return go(0, false); }
-      if (a === 'auto') return toggleAuto();
-      if (a === 'hint') { revealed = true; render(); return; }
-      if (a === 'edit') { stopAuto(); try { history.replaceState(null, '', location.pathname); } catch {} return window.BTC.home(); }
-      if (a === 'share') {
-        const url = location.origin + location.pathname + '#code=' + enc({ c: code, i: input });
-        const ok = () => { act.textContent = '✓ Link copied'; setTimeout(() => (act.textContent = '🔗 Share'), 1800); };
-        if (navigator.clipboard) navigator.clipboard.writeText(url).then(ok, () => prompt('Copy this link:', url));
-        else prompt('Copy this link:', url);
-        return;
-      }
-    }
-    const m = e.target.closest('[data-mode]');
-    if (m) {
-      mode = m.dataset.mode;
-      document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
-      feedback = ''; revealed = false;
-      return render();
-    }
-    if (busy || !board.contains(e.target) || e.target.closest('.bubble')) {
-      const ch = e.target.closest('[data-choice]');
-      if (ch) {
-        const q = questionFor(k);
-        const i = +ch.dataset.choice;
-        if (q && q.type === 'print') {
-          if (i === q.answer) return right(q);
-          const why = q.options[i].includes('<<') || /[A-Za-z_]\w*\(|\b[a-z]\w*\.\w/.test(q.options[i])
-            ? 'cout prints the <b>values</b>, not the names or code that produce them.'
-            : 'Not quite. Look at the values of the variables right now.';
-          return wrongAnswer(why, () => board.querySelector(`[data-choice="${i}"]`));
-        }
-      }
+    if (!act) return;
+    const a = act.dataset.act;
+    if (a === 'next') { stopAuto(); return go(k + 1); }
+    if (a === 'back') { stopAuto(); return go(k - 1); }
+    if (a === 'restart') { stopAuto(); return go(0); }
+    if (a === 'auto') return toggleAuto();
+    if (a === 'home' || a === 'edit') {
+      stopAuto();
+      if (a === 'edit') window.BTC.save({ c: code, i: input });
+      try { history.replaceState(null, '', location.pathname); } catch {}
+      window.BTC.home();
+      if (a === 'edit') document.getElementById('src')?.focus();
       return;
     }
-    const row = e.target.closest('.row');
-    if (!row) return;
-    const n = +row.dataset.line;
-    const cq = carryFor(k);
-    if (cq) {
-      const tk = e.target.closest('.tk');
-      if (!tk) return;
-      if (n === cq.line && tk.dataset.t === cq.name && +tk.dataset.occ === cq.occ) return right(cq);
-      return wrongAnswer(`Not there. Values passed into a function land in its <b>parameters</b>, inside the ( ) on line ${cq.line}.`, () => board.querySelector(`.row[data-line="${n}"] .tk[data-t="${CSS.escape(tk.dataset.t)}"][data-occ="${tk.dataset.occ}"]`));
-    }
-    const q = questionFor(k);
-    if (q && q.type === 'line') {
-      if (n === q.line) return right(q);
-      return wrongAnswer(lineHint(q), () => board.querySelector(`.row[data-line="${n}"]`));
+    if (a === 'share') {
+      const url = location.origin + location.pathname + (meta.id ? '#ex=' + meta.id : '#code=' + enc({ c: code, i: input })) + (k ? '@' + k : '');
+      const ok = () => { act.textContent = '✓ Link copied'; setTimeout(() => (act.textContent = '🔗 Share'), 1800); };
+      if (navigator.clipboard) navigator.clipboard.writeText(url).then(ok, () => prompt('Copy this link:', url));
+      else prompt('Copy this link:', url);
     }
   }
 
+  // Hovering a pointer lights up what it points at, in every panel.
   function onHover(e) {
     const p = e.target.closest('[data-tid]');
     if (!p) return;
@@ -652,11 +401,13 @@ int main() {
   }
 
   document.addEventListener('keydown', e => {
-    if (!document.querySelector('.trace') || /TEXTAREA|INPUT/.test(document.activeElement.tagName)) return;
-    if (e.key === 'ArrowRight') { e.preventDefault(); next(); }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); stopAuto(); go(k - 1, false); }
+    if (!document.querySelector('.viewer') || /TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) return;
+    if (e.key === 'ArrowRight') { e.preventDefault(); stopAuto(); go(k + 1); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); stopAuto(); go(k - 1); }
     else if (e.key === ' ') { e.preventDefault(); toggleAuto(); }
+    else if (e.key === 'Home') { e.preventDefault(); stopAuto(); go(0); }
+    else if (e.key === 'End') { e.preventDefault(); stopAuto(); go(R.steps.length - 1); }
   });
 
-  window.Tracer = { mountEditor, openShared };
+  window.Tracer = { open, openShared };
 })();

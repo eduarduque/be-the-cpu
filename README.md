@@ -1,36 +1,31 @@
 # Be the CPU
 
-A game for learning to follow code. **Paste any C++ program** and step through it right on top of your code:
-- a CPU marker shows the line about to run
-- variables appear next to the lines that create them
-- every function call gets its own clipboard (stack frame), with a 🚩 marking where it will return
-- pointers point into a visible heap
-- a plain-English note explains what each line just did
+A visual C++ debugger for learning. **Paste any C++ program** (or pick one from the study-notes library) and watch it run one line at a time. Nothing to answer, nothing scored: it's for seeing what the computer does.
 
-Features:
-- **🎮 Predict mode:** before each jump (function calls, returns, loops, if/else), tap the line you think runs next. You also tap where arguments land and pick what gets printed. Watching code run teaches surprisingly little; predicting it is what builds the mental model.
-- **👀 Watch mode:** step forward and back like a debugger, or press Auto.
-- **💥 Crashes explained:** null pointers, out-of-range indexes, private access, use-after-delete, uninitialized variables and infinite loops stop on the exact line, with an explanation.
-- **🔗 Share:** every traced program gets a link.
+After every line you can see:
+- **Code:** the line that runs next (▶), the line that just ran, and 🚩 where a function call is waiting to return
+- **What changed:** values that were created, changed, increased ▲, decreased ▼, pointers that moved ➜, variables that went out of scope ✕ and heap memory that was deleted 🗑
+- **Variables:** every function call on the call stack with its variables, plus the heap
+- **Array boxes:** arrays drawn as numbered boxes, with index variables (`i`, `start`, `maxIndex`...) and pointers tagged on the box they point at
+- **Memory map:** every variable, array slot, object field and heap block with its address
+- **Explanation:** a plain-English description of what the line did, including crashes (null/dangling pointers, out-of-range indexes, uninitialized values)
+- **Output:** what the program printed
 
-Under the hood, `cpp.js` is a small C++ interpreter written for teaching. It runs a beginner subset of C++ and records a full snapshot of the machine before every line:
-- classes and structs, constructors and initializer lists, methods defined outside the class
-- references, pointers, `new`/`delete`
-- `vector`, `string`
-- loops, `switch`, recursion
-- `cin`/`cout`
+Every panel can be shown or hidden with the **Show:** toggles (your choice is remembered), and addresses can be turned on or off everywhere. Step forward and back, drag the slider, or press **Auto** (slow / normal / fast). Hover a pointer to light up what it points at.
 
-Code outside that subset gets a clear "not supported yet" message instead of a wrong answer.
+## Program library
 
-## Guided levels
+`examples.js` holds short programs for each section of the C++ study notes (functions, arrays and structs, pointers, pointer parameters, `new`/`delete`, classes, constructors/destructors, copy constructors, separate compilation), an **Exam 1 walkthrough**, the **selection sort** debugger example, and a Linux command reference card.
 
-| # | Level | Concept |
-|---|-------|---------|
-| 1 | Boxes | Variables hold values, not formulas |
-| 2 | Workers | Functions, stack frames, pass by value |
-| 3 | Links | References (`int&`) |
-| 4 | Blueprints | Classes, constructors, `this`, `private`, `const` methods |
-| 5 | Clones | Recursion and the call stack |
+## How it works
+
+`cpp.js` is a small C++ interpreter written for teaching. It runs a beginner subset of C++ and records a full snapshot of the machine (call stack, variables, memory addresses, heap, output) before every line:
+- classes and structs, constructors, destructors, copy constructors, methods defined outside the class
+- references, pointers, pointer arithmetic, `new`/`delete`, `new[]`/`delete[]`
+- arrays (including 2D), `vector`, `string`
+- loops, `switch`, recursion, `cin`/`cout`
+
+Code outside that subset gets a clear "not supported yet" message instead of a wrong answer. Addresses are simulated (deterministic, realistic layout: stack grows down, heap grows up, array elements are contiguous).
 
 ## Run it
 
@@ -40,8 +35,8 @@ No build step. Open `index.html` in a browser, or serve the folder:
 npx serve .
 ```
 
-Deep links: `index.html#code=...` opens a shared program (use the Share button), `index.html#4` opens level 4, `index.html#4@8` jumps to step 8 of it.
+Links: `index.html#code=...` opens a shared program (use the Share button), `index.html#ex=<id>` opens a library example, and `@8` at the end jumps to step 8.
 
-## Adding a level
+## Adding an example
 
-Levels live in `levels.js`. Each one is a program (`code`), the function `regions` in it, and a list of `steps`. Each step says what the player must do (`ask`), what changes in the machine (`do`), and a plain-English explanation (`say`). The format is documented at the top of that file. No animation code is needed; the engine in `game.js` renders everything from the state.
+Add an item to a section in `examples.js`: `{ id, title, watch, code, input }`. `watch` is a one-line hint about what to look at while it runs.
