@@ -11,7 +11,7 @@ After every line you can see:
 - **Explanation:** a plain-English description of what the line did, including crashes (null/dangling pointers, out-of-range indexes, uninitialized values)
 - **Output:** what the program printed
 
-Every panel can be shown or hidden with the **Show:** toggles (your choice is remembered), and addresses can be turned on or off everywhere. Step forward and back, drag the slider, or press **Auto** (slow / normal / fast). Hover a pointer to light up what it points at.
+Every panel can be shown or hidden from the **Show / hide** menu (your choice is remembered), including memory addresses. Step forward and back, drag the slider, or press **Auto** (slow / normal / fast). Hover a pointer to light up what it points at.
 
 ## Program library
 

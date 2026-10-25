@@ -5,16 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Be the CPU</title>
   <meta name="description" content="A visual C++ debugger for learning: step through real C++ line by line and watch variables, addresses, pointers, arrays and the heap change.">
+  <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+  <script>tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif'], mono: ['JetBrains Mono', 'monospace'] } } } };</script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="style.css?v=3">
 </head>
-<body>
+<body class="bg-slate-900">
   <div id="app"></div>
-  <script src="examples.js"></script>
-  <script src="cpp.js"></script>
-  <script src="trace.js"></script>
-  <script src="game.js"></script>
+  <script src="examples.js?v=3"></script>
+  <script src="cpp.js?v=3"></script>
+  <script src="trace.js?v=3"></script>
+  <script src="game.js?v=3"></script>
 </body>
 </html>
