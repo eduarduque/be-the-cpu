@@ -138,7 +138,9 @@
     if (!prev) return null;
     for (const d of s.did) {
       const m = typeof d === 'string' && d.match(/^\((.*)\) is (true|false), so (.*)$/);
-      if (m) return { expr: m[1], values: evalText(m[1], prev), result: m[2] === 'true', then: m[3] };
+      // values after the line ran (so i++ in a for header is counted); if the loop just ended
+      // and its variable is gone, fall back to the values from before the line
+      if (m) { const after = evalText(m[1], s); return { expr: m[1], values: after !== m[1] ? after : evalText(m[1], prev), result: m[2] === 'true', then: m[3] }; }
     }
     return null;
   }
@@ -172,16 +174,25 @@
         f.vars.forEach(v => { if (v.anchor != null && !v.isThis) (ann[v.anchor] = ann[v.anchor] || []).push(`<span class="ml-2 text-[11px] bg-slate-800 border border-slate-700 rounded px-1.5 py-0.5 font-sans ${fi === s.frames.length - 1 ? '' : 'opacity-50'}"><span class="text-indigo-300">${esc(v.name)}</span> ${v.ref ? '📎' : esc(plainVal(v.val))}</span>`); });
       });
     }
+    // The highlight is the line that just ran, so it matches the watcher, comparison and log.
+    // The line that runs on the next Step gets a faint dashed marker.
+    const nextLine = s.kind === 'exit' || s.kind === 'error' ? null : s.line;
+    const tagHTML = (txt, cls) => `<span class="ml-2 text-[10px] font-sans font-semibold uppercase tracking-wider rounded px-1.5 py-0.5 ${cls}">${txt}</span>`;
     return lines.map((src, i) => {
       const n = i + 1;
-      const cur = s.line === n && s.kind !== 'exit';
-      const crashed = cur && s.kind === 'error';
+      const crashed = s.kind === 'error' && s.line === n;
+      const ran = !crashed && n === prevLine;
+      const next = !crashed && !ran && n === nextLine;
       const base = 'flex items-start px-2 py-0.5 rounded transition-colors whitespace-pre border-l-4';
       const c = crashed ? `${base} bg-rose-900/50 border-rose-400 text-rose-100 font-semibold`
-        : cur ? `${base} bg-indigo-900/60 border-indigo-400 text-indigo-200 font-semibold`
-        : n === prevLine ? `${base} bg-slate-700/30 border-slate-600 text-slate-300`
+        : ran ? `${base} bg-indigo-900/60 border-indigo-400 text-indigo-200 font-semibold`
+        : next ? `${base} border-dashed border-slate-500 bg-slate-800/40 text-slate-300`
         : `${base} border-transparent text-slate-300`;
-      return `<div class="${c}" data-line="${n}"><span class="w-8 shrink-0 text-right pr-3 select-none ${cur ? 'text-indigo-300' : 'text-slate-600'}">${n}</span><span class="w-4 shrink-0 text-xs">${flags[n] ? '🚩' : ''}</span><span>${window.BTC.codeHTML(src) || ' '}</span>${ann[n] ? ann[n].join('') : ''}</div>`;
+      const tag = crashed ? tagHTML('crashed', 'bg-rose-500/20 text-rose-300')
+        : ran ? tagHTML(n === nextLine ? 'just ran · runs again next' : 'just ran', 'bg-indigo-500/20 text-indigo-300')
+        : next ? tagHTML('next', 'text-slate-400 border border-dashed border-slate-500')
+        : '';
+      return `<div class="${c}" data-line="${n}"${crashed || ran ? ' data-cur' : ''}><span class="w-8 shrink-0 text-right pr-3 select-none ${crashed || ran ? 'text-indigo-300' : 'text-slate-600'}">${n}</span><span class="w-4 shrink-0 text-xs">${flags[n] ? '🚩' : ''}</span><span>${window.BTC.codeHTML(src) || ' '}</span>${tag}${ann[n] ? ann[n].join('') : ''}</div>`;
     }).join('');
   }
 
@@ -487,7 +498,7 @@
           <button data-act="closehelp" class="absolute top-4 right-4 text-slate-400 hover:text-white transition text-lg w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center"><i class="fa-solid fa-xmark"></i></button>
           <h3 class="text-lg font-bold text-white mb-3 flex items-center gap-2"><i class="fa-solid fa-graduation-cap text-indigo-400"></i> How to read this debugger</h3>
           <div class="space-y-3 text-xs md:text-sm text-slate-300 leading-relaxed">
-            <p>Press <strong>Step</strong> (or →) to run one line, <strong>Back</strong> (or ←) to undo it, <strong>Auto</strong> (or Space) to play. The <span class="text-indigo-300 font-semibold">highlighted line</span> is the one about to run.</p>
+            <p>Press <strong>Step</strong> (or →) to run one line, <strong>Back</strong> (or ←) to undo it, <strong>Auto</strong> (or Space) to play. The <span class="text-indigo-300 font-semibold">highlighted line</span> is the one that <em>just ran</em>: the variables, Active Comparison and Narrative Log all show its result. The line with the <span class="border border-dashed border-slate-500 rounded px-1">dashed outline</span> is the one that runs when you press Step.</p>
             <div class="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-2">
               <div class="flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0"></span><span><strong>Index</strong> (<code>i</code>, <code>start</code>, <code>maxIndex</code>): <em>where</em> you are looking in the array, the box number.</span></div>
               <div class="flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0"></span><span><strong>Value</strong> (<code>v[index]</code>): <em>what number</em> is inside that box.</span></div>
@@ -539,7 +550,7 @@
     $('autoplay-icon').className = autoTimer ? 'fa-solid fa-pause' : 'fa-solid fa-play';
     $('autoplay-text').textContent = autoTimer ? 'Pause' : 'Auto';
     const codeEl = $('code');
-    const cur = codeEl.querySelector('.bg-indigo-900\\/60, .bg-rose-900\\/50');
+    const cur = codeEl.querySelector('[data-cur]') || codeEl.querySelector(`[data-line="${s.line}"]`);
     if (cur) {
       const y = cur.offsetTop - codeEl.offsetTop, h = codeEl.clientHeight;
       if (y < codeEl.scrollTop + 20 || y > codeEl.scrollTop + h - 40) codeEl.scrollTo({ top: y - h / 3, behavior: autoTimer ? 'auto' : 'smooth' });
